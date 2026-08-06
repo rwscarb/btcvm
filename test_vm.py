@@ -3,6 +3,7 @@ from vm import VM
 from programs import PROGRAMS
 from vdf import VDF
 from trace import VMTrace
+from fleet import VMFleet
 
 
 def fresh(program_name):
@@ -243,3 +244,130 @@ def test_trace_does_not_affect_execution():
     assert vm_no_trace.registers == vm_trace.registers
     assert vm_no_trace.ticks == vm_trace.ticks
     assert vm_no_trace.state_hash() == vm_trace.state_hash()
+
+
+# --- VMFleet ---
+
+def test_fleet_size():
+    f = VMFleet(['fibonacci', 'countdown', 'fibonacci'])
+    assert f.size == 3
+
+def test_fleet_unknown_program():
+    with pytest.raises(ValueError):
+        VMFleet(['fibonacci', 'badprog'])
+
+def test_fleet_run_tick_returns_cycles():
+    f = VMFleet(['fibonacci', 'countdown'])
+    cycles = f.run_tick(max_steps=5)
+    assert len(cycles) == 2
+    assert all(c == 5 for c in cycles)
+
+def test_fleet_all_halted_initially_false():
+    f = VMFleet(['fibonacci', 'countdown'])
+    assert not f.all_halted()
+
+def test_fleet_all_halted_after_full_run():
+    f = VMFleet(['countdown', 'fibonacci'])
+    while not f.all_halted():
+        f.run_tick(max_steps=50)
+    assert f.all_halted()
+
+def test_fleet_vm_commitments_length():
+    f = VMFleet(['fibonacci', 'countdown', 'fibonacci'])
+    f.run_tick(max_steps=10)
+    assert len(f.vm_commitments()) == 3
+
+def test_fleet_root_is_hex64():
+    f = VMFleet(['fibonacci', 'countdown'])
+    f.run_tick(max_steps=10)
+    root = f.fleet_root()
+    assert len(root) == 64
+    int(root, 16)
+
+def test_fleet_root_deterministic():
+    f1 = VMFleet(['fibonacci', 'countdown'])
+    f1.run_tick(max_steps=10)
+
+    f2 = VMFleet(['fibonacci', 'countdown'])
+    f2.run_tick(max_steps=10)
+
+    assert f1.fleet_root() == f2.fleet_root()
+
+def test_fleet_root_changes_after_tick():
+    f = VMFleet(['fibonacci', 'countdown'])
+    f.run_tick(max_steps=5)
+    r1 = f.fleet_root()
+    f.run_tick(max_steps=5)
+    r2 = f.fleet_root()
+    assert r1 != r2
+
+def test_fleet_root_differs_from_any_single_vm():
+    f = VMFleet(['fibonacci', 'countdown'])
+    f.run_tick(max_steps=10)
+    root = f.fleet_root()
+    for commit in f.vm_commitments():
+        assert root != commit
+
+def test_fleet_snapshots_shape():
+    f = VMFleet(['fibonacci', 'countdown'])
+    cycles = f.run_tick(max_steps=10)
+    snaps = f.snapshots(cycles)
+    assert len(snaps) == 2
+    for i, snap in enumerate(snaps):
+        assert snap['vm_id'] == i
+        assert 'state_hash' in snap
+        assert 'registers' in snap
+        assert 'cycles' in snap
+
+def test_fleet_verify_fleet_root():
+    f = VMFleet(['fibonacci', 'countdown'])
+    cycles = f.run_tick(max_steps=10)
+    entry = {
+        'fleet_size': f.size,
+        'fleet_root': f.fleet_root(),
+        'vms': f.snapshots(cycles),
+    }
+    assert VMFleet.verify_fleet_root(entry)
+
+def test_fleet_verify_fleet_root_tampered():
+    f = VMFleet(['fibonacci', 'countdown'])
+    cycles = f.run_tick(max_steps=10)
+    snaps = f.snapshots(cycles)
+    snaps[0]['state_hash'] = 'a' * 64  # tamper
+    entry = {
+        'fleet_size': f.size,
+        'fleet_root': f.fleet_root(),
+        'vms': snaps,
+    }
+    assert not VMFleet.verify_fleet_root(entry)
+
+def test_fleet_with_trace():
+    f = VMFleet(['fibonacci', 'countdown'], enable_trace=True)
+    cycles = f.run_tick(max_steps=10)
+    snaps = f.snapshots(cycles)
+    for snap in snaps:
+        assert 'trace_root' in snap
+        assert len(snap['trace_root']) == 64
+
+def test_fleet_trace_root_used_in_commitment():
+    f_trace = VMFleet(['fibonacci'], enable_trace=True)
+    f_trace.run_tick(max_steps=10)
+    root_trace = f_trace.fleet_root()
+
+    f_no_trace = VMFleet(['fibonacci'], enable_trace=False)
+    f_no_trace.run_tick(max_steps=10)
+    root_no_trace = f_no_trace.fleet_root()
+
+    # Trace Merkle root != state_hash → fleet roots differ
+    assert root_trace != root_no_trace
+
+def test_fleet_single_vm_matches_standalone():
+    # Fleet of 1 with no trace should produce the same state_hash as a plain VM
+    f = VMFleet(['fibonacci'])
+    f.run_tick(max_steps=15)
+
+    vm = VM()
+    vm.load_program(PROGRAMS['fibonacci'])
+    vm.run(max_steps=15)
+
+    assert f.vm_commitments()[0] == vm.state_hash()

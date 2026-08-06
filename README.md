@@ -31,10 +31,11 @@ The resulting ledger is independently verifiable: anyone with the block hashes (
 | `programs.py` | Sample programs (fibonacci, countdown) |
 | `vdf.py` | VDF sub-clock — sequential SHA256 chain with tick/verify (v1.2) |
 | `trace.py` | Step-by-step execution trace with Merkle root commitment (v2) |
+| `fleet.py` | N parallel VMs with fleet Merkle root — one OP_RETURN anchors all (v3) |
 | `broadcast.py` | Optional OP_RETURN broadcast via the `bit` library |
-| `main.py` | Orchestrator — runs clock loop, executes VM, writes ledger |
-| `verify.py` | Verifies ledger, VDF chain, and trace against Bitcoin |
-| `test_vm.py` | Unit tests (VM, VDF, trace) |
+| `main.py` | Orchestrator — runs clock loop, executes VM(s), writes ledger |
+| `verify.py` | Verifies ledger, VDF chain, trace, and fleet Merkle against Bitcoin |
+| `test_vm.py` | Unit tests (VM, VDF, trace, fleet) |
 
 ## VM
 
@@ -66,8 +67,11 @@ python3 main.py fibonacci --vdf-ticks 5
 # v2 — trace mode: Merkle root over all step hashes replaces state_hash
 python3 main.py fibonacci --trace
 
-# v1.2 + v2 combined
-python3 main.py fibonacci --vdf-ticks 5 --trace
+# v3 — fleet mode: 4 parallel VMs, single fleet Merkle root per OP_RETURN
+python3 main.py fibonacci --vms 4
+
+# Everything combined
+python3 main.py fibonacci --vms 4 --vdf-ticks 3 --trace
 
 # Optional OP_RETURN broadcast to Bitcoin
 pip install bit
@@ -135,6 +139,23 @@ python3 verify.py --check-txs
 }
 ```
 
+**v3 entry** (fleet active) replaces per-VM fields with:
+
+```json
+{
+  "fleet_size": 4,
+  "fleet_root": "merkle_root_over_all_vm_commitments...",
+  "commitment": "SHA256(block_hash:fleet_root)",
+  "vms": [
+    {"vm_id": 0, "program": "fibonacci", "vm_ticks": 10, "cycles": 10,
+     "halted": false, "registers": [...], "state_hash": "..."},
+    {"vm_id": 1, ...},
+    {"vm_id": 2, ...},
+    {"vm_id": 3, ...}
+  ]
+}
+```
+
 ## Architecture
 
 ### VDF sub-clock (v1.2)
@@ -156,7 +177,20 @@ Every VM step is recorded as a hash-chained entry: `step_hash = SHA256(prev_hash
 This means:
 - Anyone can verify any individual step without replaying the entire execution
 - The trace file is the witness a ZK prover (RISC Zero, SP1, Cairo) would consume to generate a succinct proof
-- Future v3 replaces the Merkle commitment with an actual SNARK proof
+
+### Fleet Merkle root (v3)
+
+N VMs run in parallel each tick. Each contributes a commitment (state_hash or trace_root). A binary Merkle tree over all N commitments produces a single `fleet_root` — one value, one OP_RETURN, regardless of fleet size.
+
+```
+tick N:
+  VM_0 → commitment_0 ─┐
+  VM_1 → commitment_1 ─┤ Merkle → fleet_root → SHA256(block_hash:fleet_root) → OP_RETURN
+  VM_2 → commitment_2 ─┤
+  VM_3 → commitment_3 ─┘
+```
+
+Verification recomputes the fleet Merkle from per-VM hashes stored in the ledger entry and checks it against the recorded `fleet_root`, without re-executing any VM.
 
 ## Roadmap
 
@@ -164,7 +198,7 @@ This means:
 - ✅ **v1.1** — Ledger verification against block hashes and OP_RETURN (`--check-txs`)
 - ✅ **v1.2** — VDF sub-clock (`--vdf-ticks N`)
 - ✅ **v2** — Trace commitment / Merkle root (`--trace`)
-- **v3** — Multi-VM Merkle tree, single OP_RETURN anchors N parallel VMs
+- ✅ **v3** — Fleet Merkle tree: N parallel VMs, single OP_RETURN (`--vms N`)
 
 ## Tests
 

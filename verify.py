@@ -83,8 +83,11 @@ def verify_ledger(ledger_path: str, trace_file: str | None, check_txs: bool, tes
 
     has_vdf = any('vdf_hash' in e for e in entries)
     has_trace = any('trace_root' in e for e in entries)
+    has_fleet = any('fleet_root' in e for e in entries)
 
     mode_parts = []
+    if has_fleet:
+        mode_parts.append("fleet")
     if has_vdf:
         mode_parts.append("VDF")
     if has_trace:
@@ -164,14 +167,17 @@ def verify_ledger(ledger_path: str, trace_file: str | None, check_txs: bool, tes
         vdf_hash = entry.get('vdf_hash')
         tx_hash = entry.get('tx_hash')
 
-        # Choose the right hash for the commitment
-        state_or_root = entry.get('trace_root', entry['state_hash'])
+        # Choose the root hash for the commitment
+        if 'fleet_root' in entry:
+            state_or_root = entry['fleet_root']
+        else:
+            state_or_root = entry.get('trace_root', entry['state_hash'])
 
         prefix = f"[{i+1}/{len(entries)}] block {height}"
         if vdf_hash:
             prefix += f" tick {vdf_tick}"
 
-        # 1. Fetch canonical block hash (only for first entry per block to save API calls)
+        # 1. Fetch canonical block hash
         canon_hash = fetch(f"{api}/block-height/{height}")
         if canon_hash is None:
             print(f"{prefix} SKIP  (could not fetch block hash)")
@@ -184,7 +190,15 @@ def verify_ledger(ledger_path: str, trace_file: str | None, check_txs: bool, tes
             all_ok = False
             continue
 
-        # 2. Recompute commitment
+        # 2. Fleet: recompute Merkle root from per-VM data
+        if 'fleet_root' in entry:
+            from fleet import VMFleet
+            if not VMFleet.verify_fleet_root(entry):
+                print(f"{prefix} FAIL  fleet_root mismatch (per-VM hashes don't match)")
+                all_ok = False
+                continue
+
+        # 3. Recompute commitment
         expected = recompute_commitment(canon_hash, state_or_root, vdf_hash)
         if expected != recorded_commitment:
             print(f"{prefix} FAIL  commitment mismatch")
@@ -192,12 +206,6 @@ def verify_ledger(ledger_path: str, trace_file: str | None, check_txs: bool, tes
             print(f"         recorded:  {recorded_commitment}")
             all_ok = False
             continue
-
-        # 3. Cross-check trace root if we verified the file
-        if trace_root_verified and 'trace_root' in entry:
-            # Only the final entry's trace_root matches the file root (cumulative trace)
-            # For intermediate entries, we can only check it's a valid hex string
-            pass
 
         # 4. Optionally verify OP_RETURN on-chain
         tx_status = ""
@@ -207,8 +215,12 @@ def verify_ledger(ledger_path: str, trace_file: str | None, check_txs: bool, tes
         elif tx_hash and not str(tx_hash).startswith('ERROR'):
             tx_status = f" | tx=..{tx_hash[-8:]}"
 
-        root_key = 'trace_root' if 'trace_root' in entry else 'state_hash'
-        print(f"{prefix} OK    root=..{entry[root_key][-8:]} commit=..{recorded_commitment[-8:]}{tx_status}")
+        if 'fleet_root' in entry:
+            n = entry['fleet_size']
+            print(f"{prefix} OK    fleet={n} root=..{entry['fleet_root'][-8:]} commit=..{recorded_commitment[-8:]}{tx_status}")
+        else:
+            root_key = 'trace_root' if 'trace_root' in entry else 'state_hash'
+            print(f"{prefix} OK    root=..{entry[root_key][-8:]} commit=..{recorded_commitment[-8:]}{tx_status}")
 
     print(f"\n{'All entries verified.' if all_ok else 'VERIFICATION FAILED.'}")
     return all_ok
