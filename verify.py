@@ -150,7 +150,6 @@ def verify_ledger(ledger_path: str, trace_file: str | None, check_txs: bool, tes
             ok, computed_root = False, ''
         if ok:
             print(f"Trace: OK  Merkle root ..{computed_root[-8:]}\n")
-            trace_root_verified = computed_root
         else:
             print("Trace: FAIL  step hash mismatch\n")
     elif has_trace and trace_file:

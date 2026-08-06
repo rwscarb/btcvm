@@ -246,7 +246,7 @@ def print_entry(entry: dict):
     vdf_label = f" vdf={entry['vdf_tick']}" if entry.get('vdf_hash') else ""
     tx = ''
     if entry.get('tx_hash'):
-        tx = f" | tx=FAILED" if str(entry['tx_hash']).startswith('ERROR') else f" | tx=..{entry['tx_hash'][-8:]}"
+        tx = " | tx=FAILED" if str(entry['tx_hash']).startswith('ERROR') else f" | tx=..{entry['tx_hash'][-8:]}"
 
     if 'fleet_root' in entry:
         n = entry['fleet_size']
@@ -330,7 +330,7 @@ def main():
     if args.vdf_ticks:
         mode_parts.append(f"vdf_ticks={args.vdf_ticks}")
     if args.trace:
-        mode_parts.append(f"trace")
+        mode_parts.append("trace")
     if args.broadcast:
         mode_parts.append(f"{args.network} broadcast")
     mode_label = f" [{', '.join(mode_parts)}]" if mode_parts else ""

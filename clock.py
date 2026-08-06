@@ -1,6 +1,5 @@
 import urllib.request
 import urllib.error
-import json
 
 API_MAIN = "https://blockstream.info/api"
 API_TEST = "https://blockstream.info/testnet/api"
