@@ -1,0 +1,14 @@
+# Ruff config for btcvm
+# Start with a focused set of rules — expand over time.
+line-length = 100
+
+[lint]
+select = [
+  "E",   # pycodestyle errors
+  "F",   # pyflakes (unused imports, undefined names)
+  "W",   # pycodestyle warnings
+]
+ignore = [
+  "E501",  # line too long — will tighten later
+  "E741",  # ambiguous variable names (l, O, I) — used in register notation
+]
