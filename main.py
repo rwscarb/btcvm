@@ -105,7 +105,7 @@ def main():
 
     vm = VM()
     vm.load_program(PROGRAMS[args.program])
-    clock = BitcoinClock()
+    clock = BitcoinClock(testnet=(args.network == 'testnet'))
 
     net_label = f" [{args.network} broadcast]" if args.broadcast else ""
     print(f"BTC-Clocked VM | program={args.program} | cycles_per_block={CYCLES_PER_BLOCK}{net_label}")

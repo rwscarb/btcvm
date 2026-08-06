@@ -33,8 +33,11 @@ def broadcast_commitment(commitment_hex: str, wif: str, network: str = 'testnet'
     """
     check_available()
     key = load_key(wif, network)
+    key.get_unspents()  # force fresh UTXO fetch including mempool
     # Pass hex string directly; bit encodes as UTF-8, producing 64 ASCII bytes in OP_RETURN.
-    tx_hash = key.send([], message=commitment_hex[:64])
+    # fee=2 sat/vbyte — low priority, safe for non-urgent OP_RETURN commitments.
+    # Overrides the fee API default (which spikes to 72+ when the API is unreachable).
+    tx_hash = key.send([], message=commitment_hex[:64], fee=2)
     return tx_hash
 
 
