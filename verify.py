@@ -61,10 +61,7 @@ def check_op_return(block_hash: str, commitment: str, api: str) -> tuple[bool, s
     return False, "not found in block"
 
 
-def verify_ledger(ledger_path: str, trace_file: str | None, check_txs: bool, testnet: bool) -> bool:
-    api = API_TEST if testnet else API_MAIN
-    net_label = "testnet" if testnet else "mainnet"
-
+def verify_ledger(ledger_path: str, trace_file: str | None, check_txs: bool, testnet: bool | None) -> bool:
     try:
         with open(ledger_path) as f:
             entries = [json.loads(line) for line in f if line.strip()]
@@ -75,6 +72,14 @@ def verify_ledger(ledger_path: str, trace_file: str | None, check_txs: bool, tes
     if not entries:
         print("Ledger is empty.")
         return True
+
+    # Auto-detect network from ledger unless caller forced it
+    if testnet is None:
+        recorded_network = entries[0].get('network', 'mainnet')
+        testnet = (recorded_network == 'testnet')
+
+    api = API_TEST if testnet else API_MAIN
+    net_label = "testnet" if testnet else "mainnet"
 
     has_vdf = any('vdf_hash' in e for e in entries)
     has_trace = any('trace_root' in e for e in entries)
@@ -88,26 +93,46 @@ def verify_ledger(ledger_path: str, trace_file: str | None, check_txs: bool, tes
 
     print(f"Verifying {len(entries)} entries against Bitcoin {net_label}{mode_label} ...\n")
 
-    # --- VDF chain verification (cross-entry) ---
+    # --- VDF verification ---
+    # Each run seeds a fresh VDF from the block hash; detect run boundaries by
+    # vdf_tick == 0 or a broken input→output link, then verify each sub-chain.
     if has_vdf:
-        # Group entries by (block_height) and verify the VDF chain within each block
         from vdf import VDF, STEPS_PER_TICK
-        blocks: dict[int, list[dict]] = {}
-        for e in entries:
-            blocks.setdefault(e['block_height'], []).append(e)
+        vdf_entries = [e for e in entries if e.get('vdf_hash')]
 
-        vdf_ok = True
-        for height, block_entries in sorted(blocks.items()):
-            vdf_entries = [e for e in block_entries if e.get('vdf_hash')]
-            if not vdf_entries:
-                continue
-            ok = VDF.verify_chain(vdf_entries, steps=STEPS_PER_TICK)
-            if not ok:
-                print(f"VDF chain FAIL at block {height}")
-                vdf_ok = False
+        # Split into sub-chains at every run boundary
+        sub_chains: list[list[dict]] = []
+        current: list[dict] = []
+        for e in vdf_entries:
+            if not current or (e.get('vdf_tick', 0) == 0 or e['vdf_input'] != current[-1]['vdf_hash']):
+                if current:
+                    sub_chains.append(current)
+                current = [e]
+            else:
+                current.append(e)
+        if current:
+            sub_chains.append(current)
+
+        tick_failures = 0
+        chain_failures = 0
+        for chain in sub_chains:
+            for e in chain:
+                if not VDF.verify(e['vdf_input'], e['vdf_hash'], STEPS_PER_TICK):
+                    tick_failures += 1
+            for i in range(len(chain) - 1):
+                if chain[i + 1]['vdf_input'] != chain[i]['vdf_hash']:
+                    chain_failures += 1
+
+        vdf_ok = tick_failures == 0 and chain_failures == 0
         if vdf_ok:
-            print(f"VDF chain: OK ({len([e for e in entries if e.get('vdf_hash')])} ticks)\n")
+            runs = len(sub_chains)
+            ticks = len(vdf_entries)
+            print(f"VDF: OK  {ticks} tick(s) across {runs} run(s)\n")
         else:
+            if tick_failures:
+                print(f"VDF: FAIL  {tick_failures} bad tick(s)")
+            if chain_failures:
+                print(f"VDF chain: FAIL  {chain_failures} broken link(s)")
             print()
 
     # --- Trace verification ---
@@ -196,11 +221,13 @@ def main():
                         help='Trace file to verify against (default: trace.jsonl)')
     parser.add_argument('--check-txs', action='store_true',
                         help='Verify OP_RETURN presence in block (slower)')
-    parser.add_argument('--testnet', action='store_true',
-                        help='Use Bitcoin testnet')
+    parser.add_argument('--testnet', action='store_true', default=None,
+                        help='Force Bitcoin testnet (auto-detected from ledger by default)')
     args = parser.parse_args()
 
-    ok = verify_ledger(args.ledger, args.trace_file, args.check_txs, args.testnet)
+    # None → auto-detect from ledger; True/False → explicit override
+    testnet: bool | None = True if args.testnet else None
+    ok = verify_ledger(args.ledger, args.trace_file, args.check_txs, testnet)
     sys.exit(0 if ok else 1)
 
 

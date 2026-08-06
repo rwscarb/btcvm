@@ -98,6 +98,7 @@ def on_tick(
     entry: dict = {
         'block_height': block['height'],
         'block_hash': block['hash'],
+        'network': block.get('network', 'mainnet'),
         'vdf_tick': vdf_tick,
         'vm_ticks': vm.ticks,
         'cycles_this_tick': cycles,
@@ -266,9 +267,11 @@ def main():
         except Exception as e:
             print(f"Warning: could not check balance: {e}\n")
 
+    network_label = args.network
     while True:
         block = clock.poll()
         if block:
+            block['network'] = network_label
             entries = on_block(
                 block=block,
                 vm=vm,
