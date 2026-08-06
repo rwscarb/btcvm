@@ -29,10 +29,12 @@ The resulting ledger is independently verifiable: anyone with the block hashes (
 | `vm.py` | Minimal register machine (8 registers, 7 opcodes) |
 | `clock.py` | Bitcoin block clock via blockstream.info API |
 | `programs.py` | Sample programs (fibonacci, countdown) |
+| `vdf.py` | VDF sub-clock — sequential SHA256 chain with tick/verify (v1.2) |
+| `trace.py` | Step-by-step execution trace with Merkle root commitment (v2) |
 | `broadcast.py` | Optional OP_RETURN broadcast via the `bit` library |
 | `main.py` | Orchestrator — runs clock loop, executes VM, writes ledger |
-| `verify.py` | Verifies `ledger.jsonl` against Bitcoin block hashes |
-| `test_vm.py` | VM unit tests |
+| `verify.py` | Verifies ledger, VDF chain, and trace against Bitcoin |
+| `test_vm.py` | Unit tests (VM, VDF, trace) |
 
 ## VM
 
@@ -55,11 +57,19 @@ Programs are tuples loaded into memory. See `programs.py` for examples.
 **Requirements:** Python 3.8+, no dependencies for core operation.
 
 ```bash
-# Run (ledger only, no broadcast)
+# v1 — one entry per Bitcoin block (state hash commitment)
 python3 main.py fibonacci
-python3 main.py countdown
 
-# Run with OP_RETURN broadcast to Bitcoin mainnet
+# v1.2 — VDF sub-clock: 5 sequential-hash ticks per block, one ledger entry each
+python3 main.py fibonacci --vdf-ticks 5
+
+# v2 — trace mode: Merkle root over all step hashes replaces state_hash
+python3 main.py fibonacci --trace
+
+# v1.2 + v2 combined
+python3 main.py fibonacci --vdf-ticks 5 --trace
+
+# Optional OP_RETURN broadcast to Bitcoin
 pip install bit
 python3 main.py fibonacci --broadcast --wif <your-WIF-key> --network mainnet
 ```
@@ -77,21 +87,25 @@ Fund the address with a small amount (~5000 sats covers ~8 commitments at low fe
 **Verifying a ledger:**
 
 ```bash
-# Verify block hashes and commitments (fast)
+# Verify block hashes, commitments, VDF chain, and trace (fast)
 python3 verify.py
+
+# With a trace file
+python3 verify.py --trace-file trace.jsonl
 
 # Also check OP_RETURN presence in blocks (fetches block tx lists)
 python3 verify.py --check-txs
 ```
 
-Each ledger entry looks like:
+**v1 ledger entry:**
 
 ```json
 {
   "block_height": 961224,
   "block_hash": "000000000000...",
+  "vdf_tick": 0,
   "vm_ticks": 10,
-  "cycles_this_block": 10,
+  "cycles_this_tick": 10,
   "halted": false,
   "registers": [1, 1, 1, 20, 1, 0, 0, 0],
   "state_hash": "a3f9c2b1...",
@@ -100,13 +114,56 @@ Each ledger entry looks like:
 }
 ```
 
+**v1.2 entry** (VDF active) adds:
+
+```json
+{
+  "vdf_tick": 2,
+  "vdf_input": "prev_tick_output_hex...",
+  "vdf_hash": "this_tick_output_hex...",
+  "commitment": "SHA256(block_hash:vdf_hash:state_hash)"
+}
+```
+
+**v2 entry** (trace active) adds:
+
+```json
+{
+  "trace_root": "merkle_root_over_all_steps_hex...",
+  "trace_steps": 42,
+  "commitment": "SHA256(block_hash:trace_root)"
+}
+```
+
 ## Architecture
 
-This is **v1** — a proof of concept demonstrating the core loop. The roadmap:
+### VDF sub-clock (v1.2)
 
-- **v1.1** — Ledger verification against OP_RETURN data on-chain (`--check-txs`)
-- **v1.2** — VDF sub-clock for precision between Bitcoin blocks
-- **v2** — ZK proofs of VM execution (RISC Zero / SP1) replacing state hashes
+Between Bitcoin blocks the VM no longer fires once and waits — instead it fires once per VDF tick. Each tick is `STEPS_PER_TICK` sequential SHA256 evaluations seeded from the previous tick's output (and the first tick is seeded from the Bitcoin block hash). Because SHA256 can't be parallelised in this chained form, the ticks represent a minimum sequential cost that any verifier must replay.
+
+```
+Bitcoin block hash B_h
+  VDF tick 0:  SHA256^N(B_h) → vdf_0  →  VM cycles  →  commit_0
+  VDF tick 1:  SHA256^N(vdf_0) → vdf_1  →  VM cycles  →  commit_1
+  ...
+  Next Bitcoin block B_{h+1} reseeds the VDF
+```
+
+### Trace commitment (v2)
+
+Every VM step is recorded as a hash-chained entry: `step_hash = SHA256(prev_hash || pc || op || regs_before || regs_after)`. A binary Merkle tree over all step hashes produces a single root that replaces `state_hash` in the ledger commitment.
+
+This means:
+- Anyone can verify any individual step without replaying the entire execution
+- The trace file is the witness a ZK prover (RISC Zero, SP1, Cairo) would consume to generate a succinct proof
+- Future v3 replaces the Merkle commitment with an actual SNARK proof
+
+## Roadmap
+
+- ✅ **v1** — Bitcoin-clocked register machine, local ledger, optional OP_RETURN
+- ✅ **v1.1** — Ledger verification against block hashes and OP_RETURN (`--check-txs`)
+- ✅ **v1.2** — VDF sub-clock (`--vdf-ticks N`)
+- ✅ **v2** — Trace commitment / Merkle root (`--trace`)
 - **v3** — Multi-VM Merkle tree, single OP_RETURN anchors N parallel VMs
 
 ## Tests

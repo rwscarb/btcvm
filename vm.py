@@ -12,6 +12,7 @@ class VM:
         self.pc = 0
         self.halted = False
         self.ticks = 0
+        self.trace = None  # set to a VMTrace instance to enable step recording
 
     def load_program(self, program):
         for i, instr in enumerate(program):
@@ -27,6 +28,8 @@ class VM:
             return
 
         op = instr[0]
+        pc_before = self.pc
+        regs_before = self.registers[:] if self.trace is not None else None
 
         if op == 'LOAD':
             _, r, val = instr
@@ -56,6 +59,9 @@ class VM:
             raise ValueError(f"Unknown opcode: {op}")
 
         self.ticks += 1
+
+        if self.trace is not None:
+            self.trace.record(pc_before, op, regs_before, self.registers[:])
 
     def run(self, max_steps=None):
         steps = 0

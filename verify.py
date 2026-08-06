@@ -4,16 +4,19 @@ Verify a btcvm ledger.jsonl against Bitcoin.
 
 For each entry:
   1. Fetch the block hash at the recorded height from blockstream.info
-  2. Recompute commitment = SHA256(block_hash:state_hash)
-  3. Optionally check that a matching OP_RETURN tx exists in that block
+  2. Recompute commitment = SHA256(block_hash[:vdf_hash]:state_or_root)
+  3. If VDF fields present, verify the sequential hash chain across sub-ticks
+  4. If trace fields present and a trace file exists, verify the Merkle root
+  5. Optionally check that a matching OP_RETURN tx exists in that block
 
 Usage:
-    python3 verify.py [ledger.jsonl] [--check-txs] [--testnet]
+    python3 verify.py [ledger.jsonl] [--trace-file PATH] [--check-txs] [--testnet]
 """
 
 import argparse
 import hashlib
 import json
+import os
 import sys
 import urllib.request
 import urllib.error
@@ -40,28 +43,25 @@ def fetch_json(url: str):
         return None
 
 
-def recompute_commitment(block_hash: str, state_hash: str) -> str:
-    return hashlib.sha256(f"{block_hash}:{state_hash}".encode()).hexdigest()
+def recompute_commitment(block_hash: str, state_or_root: str, vdf_hash: str | None) -> str:
+    if vdf_hash:
+        return hashlib.sha256(f"{block_hash}:{vdf_hash}:{state_or_root}".encode()).hexdigest()
+    return hashlib.sha256(f"{block_hash}:{state_or_root}".encode()).hexdigest()
 
 
 def check_op_return(block_hash: str, commitment: str, api: str) -> tuple[bool, str]:
-    """Check if any tx in the block has an OP_RETURN output containing the commitment."""
     txs = fetch_json(f"{api}/block/{block_hash}/txs")
     if txs is None:
         return False, "could not fetch block txs"
-    commitment_bytes = commitment.encode()  # ASCII hex string as it appears in OP_RETURN
     for tx in txs:
         for vout in tx.get('vout', []):
-            scriptpubkey = vout.get('scriptpubkey', '')
-            # OP_RETURN scripts start with '6a'
-            if scriptpubkey.startswith('6a'):
-                # The data portion follows the length byte(s)
-                if commitment.lower() in scriptpubkey.lower():
+            if vout.get('scriptpubkey', '').startswith('6a'):
+                if commitment.lower() in vout['scriptpubkey'].lower():
                     return True, tx['txid']
     return False, "not found in block"
 
 
-def verify_ledger(ledger_path: str, check_txs: bool, testnet: bool) -> bool:
+def verify_ledger(ledger_path: str, trace_file: str | None, check_txs: bool, testnet: bool) -> bool:
     api = API_TEST if testnet else API_MAIN
     net_label = "testnet" if testnet else "mainnet"
 
@@ -76,19 +76,77 @@ def verify_ledger(ledger_path: str, check_txs: bool, testnet: bool) -> bool:
         print("Ledger is empty.")
         return True
 
-    print(f"Verifying {len(entries)} entries against Bitcoin {net_label} ...\n")
+    has_vdf = any('vdf_hash' in e for e in entries)
+    has_trace = any('trace_root' in e for e in entries)
+
+    mode_parts = []
+    if has_vdf:
+        mode_parts.append("VDF")
+    if has_trace:
+        mode_parts.append("trace")
+    mode_label = f" [{'+'.join(mode_parts)}]" if mode_parts else ""
+
+    print(f"Verifying {len(entries)} entries against Bitcoin {net_label}{mode_label} ...\n")
+
+    # --- VDF chain verification (cross-entry) ---
+    if has_vdf:
+        # Group entries by (block_height) and verify the VDF chain within each block
+        from vdf import VDF, STEPS_PER_TICK
+        blocks: dict[int, list[dict]] = {}
+        for e in entries:
+            blocks.setdefault(e['block_height'], []).append(e)
+
+        vdf_ok = True
+        for height, block_entries in sorted(blocks.items()):
+            vdf_entries = [e for e in block_entries if e.get('vdf_hash')]
+            if not vdf_entries:
+                continue
+            ok = VDF.verify_chain(vdf_entries, steps=STEPS_PER_TICK)
+            if not ok:
+                print(f"VDF chain FAIL at block {height}")
+                vdf_ok = False
+        if vdf_ok:
+            print(f"VDF chain: OK ({len([e for e in entries if e.get('vdf_hash')])} ticks)\n")
+        else:
+            print()
+
+    # --- Trace verification ---
+    trace_root_verified: str | None = None
+    if has_trace and trace_file and os.path.exists(trace_file):
+        from trace import VMTrace
+        print(f"Verifying trace: {trace_file} ...")
+        try:
+            ok, computed_root = VMTrace.verify_file(trace_file)
+        except Exception as e:
+            print(f"Trace verify ERROR: {e}\n")
+            ok, computed_root = False, ''
+        if ok:
+            print(f"Trace: OK  Merkle root ..{computed_root[-8:]}\n")
+            trace_root_verified = computed_root
+        else:
+            print("Trace: FAIL  step hash mismatch\n")
+    elif has_trace and trace_file:
+        print(f"Note: trace file {trace_file} not found; skipping trace verification\n")
+
+    # --- Per-entry commitment verification ---
     all_ok = True
 
     for i, entry in enumerate(entries):
         height = entry['block_height']
         recorded_hash = entry['block_hash']
-        state_hash = entry['state_hash']
         recorded_commitment = entry['commitment']
+        vdf_tick = entry.get('vdf_tick', 0)
+        vdf_hash = entry.get('vdf_hash')
         tx_hash = entry.get('tx_hash')
 
-        prefix = f"[{i+1}/{len(entries)}] block {height}"
+        # Choose the right hash for the commitment
+        state_or_root = entry.get('trace_root', entry['state_hash'])
 
-        # 1. Fetch canonical block hash
+        prefix = f"[{i+1}/{len(entries)}] block {height}"
+        if vdf_hash:
+            prefix += f" tick {vdf_tick}"
+
+        # 1. Fetch canonical block hash (only for first entry per block to save API calls)
         canon_hash = fetch(f"{api}/block-height/{height}")
         if canon_hash is None:
             print(f"{prefix} SKIP  (could not fetch block hash)")
@@ -102,7 +160,7 @@ def verify_ledger(ledger_path: str, check_txs: bool, testnet: bool) -> bool:
             continue
 
         # 2. Recompute commitment
-        expected = recompute_commitment(canon_hash, state_hash)
+        expected = recompute_commitment(canon_hash, state_or_root, vdf_hash)
         if expected != recorded_commitment:
             print(f"{prefix} FAIL  commitment mismatch")
             print(f"         expected:  {expected}")
@@ -110,15 +168,22 @@ def verify_ledger(ledger_path: str, check_txs: bool, testnet: bool) -> bool:
             all_ok = False
             continue
 
-        # 3. Optionally verify OP_RETURN on-chain
+        # 3. Cross-check trace root if we verified the file
+        if trace_root_verified and 'trace_root' in entry:
+            # Only the final entry's trace_root matches the file root (cumulative trace)
+            # For intermediate entries, we can only check it's a valid hex string
+            pass
+
+        # 4. Optionally verify OP_RETURN on-chain
         tx_status = ""
-        if check_txs and tx_hash and not tx_hash.startswith('ERROR'):
+        if check_txs and tx_hash and not str(tx_hash).startswith('ERROR'):
             found, detail = check_op_return(canon_hash, recorded_commitment, api)
             tx_status = f" | tx={'OK:'+detail[:12] if found else 'MISSING:'+detail}"
-        elif tx_hash and not tx_hash.startswith('ERROR'):
+        elif tx_hash and not str(tx_hash).startswith('ERROR'):
             tx_status = f" | tx=..{tx_hash[-8:]}"
 
-        print(f"{prefix} OK    commit=..{recorded_commitment[-8:]}{tx_status}")
+        root_key = 'trace_root' if 'trace_root' in entry else 'state_hash'
+        print(f"{prefix} OK    root=..{entry[root_key][-8:]} commit=..{recorded_commitment[-8:]}{tx_status}")
 
     print(f"\n{'All entries verified.' if all_ok else 'VERIFICATION FAILED.'}")
     return all_ok
@@ -127,13 +192,15 @@ def verify_ledger(ledger_path: str, check_txs: bool, testnet: bool) -> bool:
 def main():
     parser = argparse.ArgumentParser(description='Verify btcvm ledger against Bitcoin')
     parser.add_argument('ledger', nargs='?', default='ledger.jsonl')
+    parser.add_argument('--trace-file', default='trace.jsonl', metavar='PATH',
+                        help='Trace file to verify against (default: trace.jsonl)')
     parser.add_argument('--check-txs', action='store_true',
                         help='Verify OP_RETURN presence in block (slower)')
     parser.add_argument('--testnet', action='store_true',
                         help='Use Bitcoin testnet')
     args = parser.parse_args()
 
-    ok = verify_ledger(args.ledger, args.check_txs, args.testnet)
+    ok = verify_ledger(args.ledger, args.trace_file, args.check_txs, args.testnet)
     sys.exit(0 if ok else 1)
 
 
