@@ -139,7 +139,6 @@ def verify_ledger(ledger_path: str, trace_file: str | None, check_txs: bool, tes
             print()
 
     # --- Trace verification ---
-    trace_root_verified: str | None = None
     if has_trace and trace_file and os.path.exists(trace_file):
         from trace import VMTrace
         print(f"Verifying trace: {trace_file} ...")
