@@ -911,10 +911,9 @@ class OttShell(cmd.Cmd):
     def preloop(self):
         try:
             import readline
-            # Remove ~ and / so ~/path and subdir/file complete correctly
-            delims = readline.get_completer_delims()
-            delims = delims.replace('~', '').replace('/', '')
-            readline.set_completer_delims(delims)
+            # Use only whitespace as delimiters so full paths
+            # (~/foo, dir/file, names_with_underscores) reach the completer intact
+            readline.set_completer_delims(' \t\n')
         except ImportError:
             pass
 
@@ -943,12 +942,18 @@ class OttShell(cmd.Cmd):
             home = os.path.expanduser('~')
             matches = [('~' + m[len(home):] if m.startswith(home) else m) for m in matches]
         # Append / to directories so tab can keep descending
+        # Escape shell-special chars so readline doesn't split mid-filename
+        def _esc(s):
+            for ch in (' ', '(', ')', '[', ']', '&', '!', "'", '"', ';', ','):
+                s = s.replace(ch, '\\' + ch)
+            return s
+
         out = []
         for m in matches:
             if os.path.isdir(os.path.expanduser(m)) and not m.endswith('/'):
-                out.append(m + '/')
+                out.append(_esc(m) + '/')
             else:
-                out.append(m)
+                out.append(_esc(m))
         return out
 
     def complete_add(self, text, line, begidx, endidx):
