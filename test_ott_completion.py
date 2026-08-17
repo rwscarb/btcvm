@@ -25,10 +25,13 @@ def make_shell():
     return ott.OttShell()
 
 
+SPECIALS = set(" ()[]&!'\";",")
+
+
 def esc(s):
-    """Mirror the escaping logic in _files(); used to compute expected values."""
-    for ch in (' ', '(', ')', '[', ']', '&', '!', "'", '"', ';', ','):
-        s = s.replace(ch, '\\' + ch)
+    """Mirror the quoting logic in _files(); used to compute expected values."""
+    if any(c in s for c in SPECIALS):
+        return '"' + s.replace('"', '\\"') + '"'
     return s
 
 
@@ -63,19 +66,19 @@ class TestFilesCompleter:
         results = self.shell._files(prefix)
         assert any(r.endswith('subdir/') for r in results)
 
-    def test_space_in_filename_escaped(self):
+    def test_space_in_filename_quoted(self):
         self._make('VTS_01_1 (1).VOB')
         prefix = os.path.join(self.tmpdir, 'VTS_01_1')
         results = self.shell._files(prefix)
         assert len(results) == 1
-        assert '\\ ' in results[0]
-        assert '\\(' in results[0]
+        assert results[0].startswith('"')
+        assert results[0].endswith('"')
 
-    def test_paren_in_filename_escaped(self):
+    def test_paren_in_filename_quoted(self):
         self._make('file (copy).jpg')
         prefix = os.path.join(self.tmpdir, 'file')
         results = self.shell._files(prefix)
-        assert any('\\(' in r and '\\)' in r for r in results)
+        assert any(r.startswith('"') for r in results)
 
     def test_tilde_expansion(self):
         home = os.path.expanduser('~')
@@ -96,9 +99,9 @@ class TestFilesCompleter:
         prefix = os.path.join(self.tmpdir, 'Party')
         results = self.shell._files(prefix)
         assert len(results) == 1
-        assert '\\&' in results[0]
-        assert '\\[' in results[0]
-        assert '\\]' in results[0]
+        assert results[0].startswith('"')
+        assert '&' in results[0]
+        assert '[' in results[0]
 
     def test_no_special_chars_unchanged(self):
         self._make('simple.jpg')
@@ -160,12 +163,12 @@ class TestCompleteAdd:
         open(path, 'w').close()
         return path
 
-    def test_complete_add_returns_escaped(self):
+    def test_complete_add_returns_quoted(self):
         self._make('VTS_01_1 (1).VOB')
         prefix = os.path.join(self.tmpdir, 'VTS_01_1')
         results = self.shell.complete_add(prefix, f'a {prefix}', 2, 2 + len(prefix))
         assert len(results) == 1
-        assert '\\ ' in results[0]
+        assert results[0].startswith('"')
 
     def test_complete_add_multiple_matches(self):
         self._make('photo1.jpg')

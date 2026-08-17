@@ -941,19 +941,20 @@ class OttShell(cmd.Cmd):
         if text.startswith('~') and not expanded.startswith('~'):
             home = os.path.expanduser('~')
             matches = [('~' + m[len(home):] if m.startswith(home) else m) for m in matches]
-        # Append / to directories so tab can keep descending
-        # Escape shell-special chars so readline doesn't split mid-filename
-        def _esc(s):
-            for ch in (' ', '(', ')', '[', ']', '&', '!', "'", '"', ';', ','):
-                s = s.replace(ch, '\\' + ch)
+        # Wrap in double-quotes if the path contains any shell-special chars.
+        # Quoting is more reliable than backslash-escaping across readline builds.
+        SPECIALS = set(' ()[]&!\'";,')
+
+        def _quote(s):
+            if any(c in s for c in SPECIALS):
+                # Escape any embedded double-quotes, then wrap
+                return '"' + s.replace('"', '\\"') + '"'
             return s
 
         out = []
         for m in matches:
-            if os.path.isdir(os.path.expanduser(m)) and not m.endswith('/'):
-                out.append(_esc(m) + '/')
-            else:
-                out.append(_esc(m))
+            is_dir = os.path.isdir(os.path.expanduser(m)) and not m.endswith('/')
+            out.append(_quote(m + '/' if is_dir else m))
         return out
 
     def complete_add(self, text, line, begidx, endidx):
