@@ -25,7 +25,7 @@ def make_shell():
     return ott.OttShell()
 
 
-SPECIALS = set(" ()[]&!'\";",")
+SPECIALS = set(" ()[]&!'\";") | {','}
 
 
 def esc(s):
