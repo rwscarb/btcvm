@@ -41,7 +41,7 @@ except ImportError:
     _HAS_QR = False
 
 CHUNK_SIZE_DEFAULT = 256 * 1024  # 256 KB
-VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v', '.mts', '.ts'}
+VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v', '.mts', '.ts', '.vob', '.mpg', '.mpeg', '.m2ts', '.wmv', '.flv', '.ogv'}
 
 
 # ── Exceptions ────────────────────────────────────────────────────────────────
@@ -680,9 +680,11 @@ def cmd_qr(data: str, label: str = ''):
 # ── Interactive shell ─────────────────────────────────────────────────────────
 
 def _run(fn, *args, **kwargs):
-    """Call a cmd_* function, printing OttError neatly."""
+    """Call a cmd_* function, printing errors neatly."""
     try:
         fn(*args, **kwargs)
+    except KeyboardInterrupt:
+        print('\n  interrupted')
     except OttNotFoundError as e:
         print(f'  ✗ {e}')
     except OttError as e:
@@ -937,7 +939,10 @@ def main():
             else:
                 cmd_qr(sha256_file(t), label=os.path.basename(t))
         elif args.cmd == 'shell' or args.cmd is None:
-            OttShell().cmdloop()
+            try:
+                OttShell().cmdloop()
+            except KeyboardInterrupt:
+                print()
     except OttNotFoundError as e:
         print(f'  ✗ {e}', file=sys.stderr)
         sys.exit(1)
@@ -947,4 +952,8 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        sys.exit(0)
