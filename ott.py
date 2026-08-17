@@ -421,12 +421,15 @@ def cmd_list():
     print(f'  {"#":<4} {"T":<2} {"name":<36} {"sha256":<18} {"size":>10}  {"  "}')
     print('  ' + '-' * 88)
     for i, e in enumerate(entries):
-        t = 'V' if e.get('type') == 'video' else 'I'
-        ok = '✅' if os.path.isfile(e.get('last_path', '')) else '⚠️ '
+        etype = e.get('type', 'image')
+        t = {'video': 'V', 'repo': 'R'}.get(etype, 'I')
+        is_repo = etype == 'repo'
+        path_ok = (os.path.isdir if is_repo else os.path.isfile)(e.get('last_path', ''))
+        ok = '✅' if path_ok else '⚠️ '
         print(f'  {i:<4} {t:<2} {e["name"]:<36} {e["sha256"][:16]}…  '
               f'{e.get("size", 0):>10,}  {ok}')
     print(f'\n  Merkle root: {store.current_root()}')
-    print('  T: I=image V=video  ✅=at last_path  ⚠️ =path missing (run ott find)')
+    print('  T: I=image V=video R=repo  ✅=at last_path  ⚠️ =path missing (run ott find)')
 
 
 def cmd_commit():
