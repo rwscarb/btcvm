@@ -926,7 +926,20 @@ class OttShell(cmd.Cmd):
 
     def _files(self, text: str) -> list[str]:
         import glob
-        return glob.glob(text + '*')
+        expanded = os.path.expanduser(text)
+        matches = glob.glob(expanded + '*')
+        # If ~ was expanded, put it back so readline inserts the right thing
+        if text.startswith('~') and not expanded.startswith('~'):
+            home = os.path.expanduser('~')
+            matches = [('~' + m[len(home):] if m.startswith(home) else m) for m in matches]
+        # Append / to directories so tab can keep descending
+        out = []
+        for m in matches:
+            if os.path.isdir(os.path.expanduser(m)) and not m.endswith('/'):
+                out.append(m + '/')
+            else:
+                out.append(m)
+        return out
 
     def complete_add(self, text, line, begidx, endidx):
         return self._files(text)
