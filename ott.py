@@ -682,6 +682,65 @@ def _git_available() -> bool:
     return shutil.which('git') is not None
 
 
+def _gpg_available() -> bool:
+    import shutil
+    return shutil.which('gpg') is not None
+
+
+def _gpg(repo_path: str, *args) -> str:
+    """Run gpg; return stdout. Raises OttError on failure."""
+    import subprocess
+    result = subprocess.run(
+        ['gpg', *args],
+        capture_output=True, text=True, cwd=repo_path,
+    )
+    if result.returncode != 0:
+        raise OttError(f'gpg error: {result.stderr.strip()}')
+    return result.stdout.strip()
+
+
+def _gpg_key_fingerprint(key_id: str | None = None) -> tuple[str, str]:
+    """Return (fingerprint, uid) for key_id (or default signing key)."""
+    import subprocess
+    args = ['gpg', '--with-colons', '--fingerprint']
+    if key_id:
+        args.append(key_id)
+    result = subprocess.run(args, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise OttError(f'gpg key lookup failed: {result.stderr.strip()}')
+    fingerprint = uid = None
+    for line in result.stdout.splitlines():
+        parts = line.split(':')
+        if parts[0] == 'fpr' and not fingerprint:
+            fingerprint = parts[9]
+        if parts[0] == 'uid' and not uid:
+            uid = parts[9]
+    if not fingerprint:
+        raise OttError('No GPG key found' + (f' for {key_id}' if key_id else ''))
+    return fingerprint, uid or ''
+
+
+def _git_signing_key(repo_path: str) -> str | None:
+    """Return user.signingkey from git config, or None."""
+    import subprocess
+    result = subprocess.run(
+        ['git', '-C', repo_path, 'config', '--get', 'user.signingkey'],
+        capture_output=True, text=True,
+    )
+    return result.stdout.strip() or None
+
+
+def _git_verify_tag(repo_path: str, tag: str) -> tuple[bool, str]:
+    """Verify a signed git tag. Returns (ok, gpg_output)."""
+    import subprocess
+    result = subprocess.run(
+        ['git', '-C', repo_path, 'verify-tag', '--raw', tag],
+        capture_output=True, text=True,
+    )
+    output = result.stderr + result.stdout
+    return result.returncode == 0, output
+
+
 def repo_leaf(git_hash: str) -> str:
     """Global Merkle leaf for a repo = SHA256(git_commit_hash)."""
     return hashlib.sha256(git_hash.encode()).hexdigest()
@@ -825,6 +884,146 @@ def cmd_repo_verify(repo_path_or_name: str):
             print('  On-chain:    ⚠️  root not yet committed')
 
 
+def cmd_repo_tag(repo_path_or_name: str, tag: str, key_id: str | None = None, message: str | None = None):
+    """Create a signed git tag and record the GPG fingerprint in the manifest."""
+    if not _git_available():
+        raise OttError('git not found in PATH')
+    if not _gpg_available():
+        raise OttError('gpg not found in PATH')
+
+    store = get_store()
+    entries = store.load_manifest()
+    abs_path = os.path.abspath(repo_path_or_name)
+    name = os.path.basename(abs_path)
+    entry = next(
+        (e for e in entries
+         if e.get('type') == 'repo' and (e['name'] == name or e.get('last_path') == abs_path)),
+        None,
+    )
+    if entry is None:
+        raise OttError(f'{name} not in archive — run `ott repo add` first')
+
+    if not os.path.isdir(os.path.join(abs_path, '.git')):
+        raise OttError(f'{abs_path} is not a git repository')
+
+    # Resolve signing key: explicit arg > git config > gpg default
+    signing_key = key_id or _git_signing_key(abs_path)
+    fingerprint, uid = _gpg_key_fingerprint(signing_key)
+
+    # Create the signed tag
+    tag_msg = message or f'ott: {name} @ {entry["git_hash"][:12]}'
+    sign_args = ['tag', '-s', tag, '-m', tag_msg]
+    if signing_key:
+        sign_args += ['-u', signing_key]
+    _git(abs_path, *sign_args)
+    print(f'  ✅ Signed tag: {tag}')
+    print(f'     Key:   {fingerprint}')
+    print(f'     UID:   {uid}')
+
+    # Verify immediately
+    ok, gpg_out = _git_verify_tag(abs_path, tag)
+    if not ok:
+        raise OttError(f'Tag verification failed after signing:\n{gpg_out}')
+    print(f'     Verify: ✅')
+
+    # Record in manifest
+    updates = {
+        'git_tag':         tag,
+        'gpg_fingerprint': fingerprint,
+        'gpg_uid':         uid,
+        'gpg_signed_at':   time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+    }
+    store.update_entry(entry['sha256'], updates)
+    print(f'     Recorded in manifest')
+    print(f'\n  To push the tag:')
+    print(f'     git push origin {tag}')
+
+
+def cmd_repo_verify_tag(repo_path_or_name: str, tag: str | None = None):
+    """Verify a signed tag (stored or specified) and show full chain."""
+    store = get_store()
+    entries = store.load_manifest()
+    abs_path = os.path.abspath(repo_path_or_name)
+    name = os.path.basename(abs_path)
+    entry = next(
+        (e for e in entries
+         if e.get('type') == 'repo' and (e['name'] == name or e.get('last_path') == abs_path)),
+        None,
+    )
+    if entry is None:
+        raise OttError(f'{name} not in archive')
+
+    tag_name = tag or entry.get('git_tag')
+    if not tag_name:
+        raise OttError(f'No tag stored for {name} — run `ott repo tag {name} <tagname>` first')
+
+    if not _git_available():
+        raise OttError('git not found in PATH')
+    if not os.path.isdir(os.path.join(abs_path, '.git')):
+        print(f'  ⚠️  Repo not at {abs_path} — verifying stored fingerprint only')
+        tag_ok, gpg_out = False, ''
+    else:
+        tag_ok, gpg_out = _git_verify_tag(abs_path, tag_name)
+
+    # Parse fingerprint from gpg --status output
+    live_fpr = None
+    for line in gpg_out.splitlines():
+        if '[GNUPG:] VALIDSIG' in line:
+            parts = line.split()
+            if len(parts) >= 3:
+                live_fpr = parts[2]
+
+    stored_fpr = entry.get('gpg_fingerprint')
+
+    # Merkle proof
+    all_leaves = [e['sha256'] for e in entries]
+    idx = all_leaves.index(entry['sha256'])
+    root = merkle_root(all_leaves)
+    proof = merkle_proof(all_leaves, idx)
+    merkle_ok = verify_proof(entry['sha256'], proof, root)
+
+    print(f'  Repo:        {name}')
+    print(f'  Tag:         {tag_name}')
+    print(f'  Commit:      {entry["git_hash"]}')
+    if tag_ok:
+        print(f'  GPG sig:     ✅ valid')
+    else:
+        print(f'  GPG sig:     ✗ invalid or repo not available')
+    if stored_fpr:
+        match = live_fpr == stored_fpr if live_fpr else None
+        match_icon = '✅' if match else ('⚠️ unverified' if match is None else '✗ MISMATCH')
+        print(f'  Fingerprint: {stored_fpr}  {match_icon}')
+    if entry.get('gpg_uid'):
+        print(f'  Signed by:   {entry["gpg_uid"]}')
+    if entry.get('gpg_signed_at'):
+        print(f'  Signed at:   {entry["gpg_signed_at"]}')
+    print(f'  Merkle root: {root}')
+    print(f'  Proof:       {"✅ valid" if merkle_ok else "✗ invalid"}  ({len(proof)} steps)')
+
+    ledger = store.load_ledger()
+    if ledger:
+        last = ledger[-1]
+        if last.get('merkle_root') == root:
+            print(f'  On-chain:    ✅ root committed at block {last.get("block_height", "?")}')
+        else:
+            print('  On-chain:    ⚠️  root not yet committed')
+
+    print()
+    print('  Full chain:')
+    print(f'    GPG key ({stored_fpr[:16] if stored_fpr else "?"}…)')
+    print(f'      ↓ signs')
+    print(f'    git tag {tag_name!r} → commit {entry["git_hash"][:16]}…')
+    print(f'      ↓ SHA256')
+    print(f'    Merkle leaf {entry["sha256"][:16]}…')
+    print(f'      ↓ Merkle tree')
+    print(f'    Root {root[:16]}…')
+    print(f'      ↓ Bitcoin block')
+    ledger = store.load_ledger()
+    if ledger:
+        last = ledger[-1]
+        print(f'    Block {last.get("block_height", "?")} commitment {last.get("commitment", "?")[:16]}…')
+
+
 def cmd_repo_update(repo_path_or_name: str):
     """Re-add repo at current HEAD."""
     store = get_store()
@@ -857,6 +1056,18 @@ def cmd_repo(subcmd: str, args: list[str]):
         if not args:
             raise OttError('Usage: repo update <path_or_name>')
         cmd_repo_update(args[0])
+    elif subcmd in ('tag', 't'):
+        if len(args) < 2:
+            raise OttError('Usage: repo tag <path_or_name> <tagname> [key_id] [message]')
+        cmd_repo_tag(
+            args[0], args[1],
+            key_id=args[2] if len(args) > 2 else None,
+            message=args[3] if len(args) > 3 else None,
+        )
+    elif subcmd in ('verify-tag', 'vt'):
+        if not args:
+            raise OttError('Usage: repo verify-tag <path_or_name> [tagname]')
+        cmd_repo_verify_tag(args[0], args[1] if len(args) > 1 else None)
     elif subcmd in ('qr',):
         target = args[0] if args else None
         store = get_store()
@@ -1047,17 +1258,17 @@ class OttShell(cmd.Cmd):
         _run(cmd_find, parts[0], parts[1] if len(parts) > 1 else None)
 
     def do_repo(self, arg):
-        """repo <add|list|verify|update|qr> [args]  — Archive git repos."""
+        """repo <add|list|verify|update|tag|verify-tag|qr> [args]  — Archive git repos."""
         parts = shlex.split(arg)
         if not parts:
-            print('  repo subcommands: add, list (ls), verify (v), update (up), qr')
+            print('  repo subcommands: add, list (ls), verify (v), update (up), tag (t), verify-tag (vt), qr')
             return
         _run(cmd_repo, parts[0], parts[1:])
 
     def complete_repo(self, text, line, begidx, endidx):
         parts = shlex.split(line[:begidx])
         if len(parts) == 1:  # completing subcommand
-            subcmds = ['add', 'list', 'verify', 'update', 'qr']
+            subcmds = ['add', 'list', 'verify', 'update', 'tag', 'verify-tag', 'qr']
             return [s for s in subcmds if s.startswith(text)]
         if len(parts) == 2:  # completing path/name
             if parts[1] in ('verify', 'v', 'update', 'up', 'qr'):
@@ -1195,8 +1406,10 @@ def main():
     p_qr.add_argument('target', nargs='?')
 
     p_repo = sub.add_parser('repo', help='Archive git repos')
-    p_repo.add_argument('subcmd', choices=['add', 'list', 'ls', 'verify', 'update', 'up', 'qr'],
-                        metavar='add|list|verify|update|qr')
+    p_repo.add_argument('subcmd',
+                        choices=['add', 'list', 'ls', 'verify', 'update', 'up',
+                                 'tag', 't', 'verify-tag', 'vt', 'qr'],
+                        metavar='add|list|verify|update|tag|verify-tag|qr')
     p_repo.add_argument('args', nargs='*')
 
     args = parser.parse_args()
