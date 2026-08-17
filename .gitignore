@@ -1,2 +1,6 @@
 __pycache__/
+build/
 ledger.jsonl
+btcvm.egg-info/
+imgfs_ledger.jsonl
+imgfs_manifest.jsonl

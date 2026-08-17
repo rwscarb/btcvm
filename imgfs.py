@@ -242,8 +242,11 @@ def cmd_commit():
     print('  Fetching latest Bitcoin block...')
 
     try:
-        from clock import latest_block  # btcvm clock module
-        block = latest_block()
+        from clock import get_tip  # btcvm clock module
+        height, block_hash = get_tip()
+        if height is None:
+            raise RuntimeError('get_tip returned None — network unreachable?')
+        block = {'height': height, 'hash': block_hash}
     except Exception as e:
         print(f'  ✗ Could not fetch block: {e}')
         print('  Committing with synthetic block hash (offline mode).')

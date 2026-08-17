@@ -38,6 +38,9 @@ testpaths = ["."]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 
+[tool.setuptools]
+py-modules = ["main", "vm", "clock", "trace", "fleet", "vdf", "verify", "broadcast", "asm", "programs", "imgfs"]
+
 [tool.ruff]
 line-length = 100
 
