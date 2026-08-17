@@ -911,8 +911,9 @@ class OttShell(cmd.Cmd):
     def preloop(self):
         try:
             import readline
-            # Remove ~ from delimiters so ~/path completes correctly
-            delims = readline.get_completer_delims().replace('~', '')
+            # Remove ~ and / so ~/path and subdir/file complete correctly
+            delims = readline.get_completer_delims()
+            delims = delims.replace('~', '').replace('/', '')
             readline.set_completer_delims(delims)
         except ImportError:
             pass
