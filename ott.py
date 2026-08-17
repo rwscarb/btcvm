@@ -908,6 +908,15 @@ class OttShell(cmd.Cmd):
     )
     prompt = 'ott> '
 
+    def preloop(self):
+        try:
+            import readline
+            # Remove ~ from delimiters so ~/path completes correctly
+            delims = readline.get_completer_delims().replace('~', '')
+            readline.set_completer_delims(delims)
+        except ImportError:
+            pass
+
     # ── completion helpers ────────────────────────────────────────────────────
 
     def _manifest_names(self, text: str) -> list[str]:
