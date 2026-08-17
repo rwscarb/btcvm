@@ -491,7 +491,7 @@ def cmd_verify(path_or_name: str):
             return
         digest = entry['sha256']
         source = f'manifest only (file not found at {entry.get("last_path", "?")})'
-        print(f'  ⚠️  File not at last known path — proof uses stored hash')
+        print('  ⚠️  File not at last known path — proof uses stored hash')
         print(f'     Run `ott find {name}` to locate it and update the record')
 
     if digest not in leaves:
@@ -850,14 +850,37 @@ class OttShell(cmd.Cmd):
 
     # ── aliases ───────────────────────────────────────────────────────────────
 
-    def do_l(self, a):     """l     — list""";           self.do_list(a)
-    def do_ls(self, a):    """ls    — list""";           self.do_list(a)
-    def do_st(self, a):    """st    — status""";         self.do_status(a)
-    def do_a(self, a):     """a     — add""";             self.do_add(a)
-    def do_v(self, a):     """v     — verify""";          self.do_verify(a)
-    def do_vc(self, a):    """vc    — verify_chunk""";    self.do_verify_chunk(a)
-    def do_ci(self, a):    """ci    — commit""";          self.do_commit(a)
-    def do_q(self, a):     """q     — quit""";             return self.do_quit(a)
+    def do_l(self, a):
+        """l   — list"""
+        self.do_list(a)
+
+    def do_ls(self, a):
+        """ls  — list"""
+        self.do_list(a)
+
+    def do_st(self, a):
+        """st  — status"""
+        self.do_status(a)
+
+    def do_a(self, a):
+        """a   — add"""
+        self.do_add(a)
+
+    def do_v(self, a):
+        """v   — verify"""
+        self.do_verify(a)
+
+    def do_vc(self, a):
+        """vc  — verify_chunk"""
+        self.do_verify_chunk(a)
+
+    def do_ci(self, a):
+        """ci  — commit"""
+        self.do_commit(a)
+
+    def do_q(self, a):
+        """q   — quit"""
+        return self.do_quit(a)
 
     def complete_a(self, *a):    return self.complete_add(*a)
     def complete_v(self, *a):    return self.complete_verify(*a)
@@ -872,6 +895,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest='cmd')
+    sub.add_parser('help', help='Show this help message')
 
     p_migrate = sub.add_parser('migrate', help='Import old flat manifest/ledger into .ott/')
     p_migrate.add_argument('path', nargs='?', default=None)
@@ -910,7 +934,9 @@ def main():
     args = parser.parse_args()
 
     try:
-        if args.cmd == 'migrate':
+        if args.cmd == 'help' or args.cmd is None and len(sys.argv) > 1:
+            parser.print_help()
+        elif args.cmd == 'migrate':
             cmd_migrate(args.path)
         elif args.cmd == 'init':
             cmd_init(args.path, args.migrate)
