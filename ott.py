@@ -534,6 +534,20 @@ class ImgfsShell(cmd.Cmd):
     def emptyline(self):
         pass
 
+    # ── aliases ──────────────────────────────────────────────────────────
+
+    def do_ls(self, a):   """ls   — list""";           self.do_list(a)
+    def do_st(self, a):   """st   — status""";         self.do_status(a)
+    def do_a(self, a):    """a    — add""";             self.do_add(a)
+    def do_v(self, a):    """v    — verify""";          self.do_verify(a)
+    def do_vc(self, a):   """vc   — verify_chunk""";    self.do_verify_chunk(a)
+    def do_ci(self, a):   """ci   — commit""";          self.do_commit(a)
+    def do_q(self, a):    """q    — quit""";             return self.do_quit(a)
+
+    def complete_a(self, *a):    return self.complete_add(*a)
+    def complete_v(self, *a):    return self.complete_verify(*a)
+    def complete_vc(self, *a):   return self.complete_verify_chunk(*a)
+
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
