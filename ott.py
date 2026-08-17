@@ -663,6 +663,216 @@ def cmd_mv(name_or_hash: str, new_path: str):
     print(f'  ✅ {entry["name"]} → {abs_new}')
 
 
+# ── Git / repo ───────────────────────────────────────────────────────────────
+
+def _git(repo_path: str, *args) -> str:
+    """Run a git command in repo_path; return stdout stripped. Raises OttError on failure."""
+    import subprocess
+    result = subprocess.run(
+        ['git', '-C', repo_path, *args],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise OttError(f'git error: {result.stderr.strip()}')
+    return result.stdout.strip()
+
+
+def _git_available() -> bool:
+    import shutil
+    return shutil.which('git') is not None
+
+
+def repo_leaf(git_hash: str) -> str:
+    """Global Merkle leaf for a repo = SHA256(git_commit_hash)."""
+    return hashlib.sha256(git_hash.encode()).hexdigest()
+
+
+def cmd_repo_add(repo_path: str, commit: str | None = None):
+    """Add or update a git repo in the archive."""
+    if not _git_available():
+        raise OttError('git not found in PATH')
+    store = get_store()
+    abs_path = os.path.abspath(repo_path)
+
+    if not os.path.isdir(os.path.join(abs_path, '.git')):
+        raise OttError(f'{abs_path} is not a git repository')
+
+    git_hash = _git(abs_path, 'rev-parse', commit or 'HEAD')
+    name     = os.path.basename(abs_path)
+
+    try:
+        remote = _git(abs_path, 'remote', 'get-url', 'origin')
+    except OttError:
+        remote = None
+    try:
+        branch = _git(abs_path, 'branch', '--show-current')
+    except OttError:
+        branch = None
+    try:
+        subject = _git(abs_path, 'log', '-1', '--pretty=%s', git_hash)
+    except OttError:
+        subject = None
+
+    leaf = repo_leaf(git_hash)
+    entries = store.load_manifest()
+    existing_names = {e['name']: e for e in entries if e.get('type') == 'repo'}
+
+    if name in existing_names and existing_names[name]['sha256'] == leaf:
+        print(f'  = already archived: {name} @ {git_hash[:12]}…')
+        return
+
+    if name in existing_names:
+        # Update: remove old leaf by appending a tombstone-replace
+        old = existing_names[name]
+        print(f'  ~ updating {name}: {old["git_hash"][:12]}… → {git_hash[:12]}…')
+
+    entry = {
+        'sha256':    leaf,
+        'name':      name,
+        'last_path': abs_path,
+        'type':      'repo',
+        'git_hash':  git_hash,
+        'remote':    remote,
+        'branch':    branch,
+        'subject':   subject,
+        'added':     time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        'size':      0,
+        'n_chunks':  1,
+        'chunk_size': None,
+    }
+    store.save_entry(entry)
+    root = store.current_root()
+    print(f'  + {name}  {git_hash[:16]}…')
+    if subject:
+        print(f'    "{subject}"')
+    if remote:
+        print(f'    remote: {remote}')
+    print(f'\n  Merkle root: {root}')
+
+
+def cmd_repo_list():
+    store = get_store()
+    entries = [e for e in store.load_manifest() if e.get('type') == 'repo']
+    if not entries:
+        print('  No repos archived.')
+        return
+    print(f'  {"#":<4} {"name":<28} {"commit":<16} {"branch":<16}  remote')
+    print('  ' + '-' * 88)
+    for i, e in enumerate(entries):
+        at_path = os.path.isdir(e.get('last_path', ''))
+        ok = '✅' if at_path else '⚠️ '
+        branch = e.get('branch') or '—'
+        remote = e.get('remote') or '—'
+        print(f'  {i:<4} {e["name"]:<28} {e["git_hash"][:14]}…  '
+              f'{branch:<16}  {remote}  {ok}')
+    print(f'\n  Merkle root: {store.current_root()}')
+
+
+def cmd_repo_verify(repo_path_or_name: str):
+    store = get_store()
+    entries = store.load_manifest()
+    all_leaves = [e['sha256'] for e in entries]
+
+    # Resolve by name or path
+    abs_path = os.path.abspath(repo_path_or_name)
+    name = os.path.basename(abs_path)
+    entry = next(
+        (e for e in entries
+         if e.get('type') == 'repo' and (e['name'] == name or e.get('last_path') == abs_path)),
+        None,
+    )
+    if entry is None:
+        raise OttError(f'{name} not in archive as a repo')
+
+    stored_git_hash = entry['git_hash']
+    stored_leaf     = entry['sha256']
+
+    # Live HEAD check
+    live_git_hash = None
+    head_matches  = None
+    if _git_available() and os.path.isdir(os.path.join(abs_path, '.git')):
+        try:
+            live_git_hash = _git(abs_path, 'rev-parse', 'HEAD')
+            head_matches  = live_git_hash == stored_git_hash
+        except OttError:
+            pass
+
+    idx   = all_leaves.index(stored_leaf)
+    root  = merkle_root(all_leaves)
+    proof = merkle_proof(all_leaves, idx)
+    ok    = verify_proof(stored_leaf, proof, root)
+
+    print(f'  Repo:        {entry["name"]}')
+    print(f'  Archived:    {stored_git_hash}')
+    if entry.get('subject'):
+        print(f'  Commit msg:  "{entry["subject"]}"')
+    if live_git_hash is not None:
+        icon = '✅' if head_matches else '⚠️ '
+        print(f'  HEAD now:    {live_git_hash}  {icon}')
+        if not head_matches:
+            print('               (HEAD has moved since archiving — run `ott repo add` to update)')
+    print(f'  Leaf:        {stored_leaf[:32]}…  (SHA256 of commit hash)')
+    print(f'  Leaf index:  {idx} of {len(all_leaves)}')
+    print(f'  Merkle root: {root}')
+    print(f'  Proof:       {"✅ valid" if ok else "✗ invalid"}  ({len(proof)} steps)')
+
+    ledger = store.load_ledger()
+    if ledger:
+        last = ledger[-1]
+        if last.get('merkle_root') == root:
+            print(f'  On-chain:    ✅ root committed at block {last.get("block_height", "?")}')
+        else:
+            print('  On-chain:    ⚠️  root not yet committed')
+
+
+def cmd_repo_update(repo_path_or_name: str):
+    """Re-add repo at current HEAD."""
+    store = get_store()
+    entries = store.load_manifest()
+    abs_path = os.path.abspath(repo_path_or_name)
+    name = os.path.basename(abs_path)
+    entry = next(
+        (e for e in entries
+         if e.get('type') == 'repo' and (e['name'] == name or e.get('last_path') == abs_path)),
+        None,
+    )
+    if entry is None:
+        raise OttError(f'{name} not in archive — use `ott repo add` first')
+    cmd_repo_add(entry.get('last_path', abs_path))
+
+
+def cmd_repo(subcmd: str, args: list[str]):
+    """Dispatch ott repo <subcmd> <args>."""
+    if subcmd in ('add', 'a'):
+        if not args:
+            raise OttError('Usage: repo add <path> [commit]')
+        cmd_repo_add(args[0], args[1] if len(args) > 1 else None)
+    elif subcmd in ('list', 'ls', 'l'):
+        cmd_repo_list()
+    elif subcmd in ('verify', 'v'):
+        if not args:
+            raise OttError('Usage: repo verify <path_or_name>')
+        cmd_repo_verify(args[0])
+    elif subcmd in ('update', 'up'):
+        if not args:
+            raise OttError('Usage: repo update <path_or_name>')
+        cmd_repo_update(args[0])
+    elif subcmd in ('qr',):
+        target = args[0] if args else None
+        store = get_store()
+        entries = [e for e in store.load_manifest() if e.get('type') == 'repo']
+        if target:
+            entry = next((e for e in entries if e['name'] == target or
+                          e.get('last_path') == os.path.abspath(target)), None)
+            if entry is None:
+                raise OttError(f'{target} not in archive')
+            cmd_qr(entry['git_hash'], label=f'{entry["name"]} commit')
+        else:
+            cmd_qr(store.current_root(), label='current Merkle root')
+    else:
+        print('  repo subcommands: add, list, verify, update, qr')
+
+
 def cmd_qr(data: str, label: str = ''):
     if not _HAS_QR:
         print('  ⚠️  qrcode not installed — pip install qrcode')
@@ -807,6 +1017,30 @@ class OttShell(cmd.Cmd):
             return
         _run(cmd_find, parts[0], parts[1] if len(parts) > 1 else None)
 
+    def do_repo(self, arg):
+        """repo <add|list|verify|update|qr> [args]  — Archive git repos."""
+        parts = shlex.split(arg)
+        if not parts:
+            print('  repo subcommands: add, list (ls), verify (v), update (up), qr')
+            return
+        _run(cmd_repo, parts[0], parts[1:])
+
+    def complete_repo(self, text, line, begidx, endidx):
+        parts = shlex.split(line[:begidx])
+        if len(parts) == 1:  # completing subcommand
+            subcmds = ['add', 'list', 'verify', 'update', 'qr']
+            return [s for s in subcmds if s.startswith(text)]
+        if len(parts) == 2:  # completing path/name
+            if parts[1] in ('verify', 'v', 'update', 'up', 'qr'):
+                try:
+                    names = [e['name'] for e in get_store().load_manifest()
+                             if e.get('type') == 'repo']
+                    return [n for n in names if n.startswith(text)] or self._files(text)
+                except OttNotFoundError:
+                    pass
+            return self._files(text)
+        return []
+
     def do_migrate(self, arg):
         """migrate [path]  — Import old ott_manifest.jsonl / imgfs_manifest.jsonl into .ott/"""
         parts = shlex.split(arg)
@@ -931,6 +1165,11 @@ def main():
     p_qr = sub.add_parser('qr', help='QR code for a hash, file, or current root')
     p_qr.add_argument('target', nargs='?')
 
+    p_repo = sub.add_parser('repo', help='Archive git repos')
+    p_repo.add_argument('subcmd', choices=['add', 'list', 'ls', 'verify', 'update', 'up', 'qr'],
+                        metavar='add|list|verify|update|qr')
+    p_repo.add_argument('args', nargs='*')
+
     args = parser.parse_args()
 
     try:
@@ -964,6 +1203,8 @@ def main():
                 cmd_qr(t, label='hash')
             else:
                 cmd_qr(sha256_file(t), label=os.path.basename(t))
+        elif args.cmd == 'repo':
+            cmd_repo(args.subcmd, args.args)
         elif args.cmd == 'shell' or args.cmd is None:
             try:
                 OttShell().cmdloop()
