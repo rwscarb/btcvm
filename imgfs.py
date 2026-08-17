@@ -18,10 +18,18 @@ Usage:
 """
 
 import argparse
+import cmd
 import hashlib
 import json
 import os
+import shlex
 import time
+
+try:
+    import qrcode  # pip install qrcode
+    _HAS_QR = True
+except ImportError:
+    _HAS_QR = False
 
 
 MANIFEST_PATH = os.environ.get('IMGFS_MANIFEST', 'imgfs_manifest.jsonl')
@@ -275,6 +283,8 @@ def cmd_commit():
     print()
     print('  To anchor on-chain:')
     print(f'    python broadcast.py {commitment}')
+    print()
+    cmd_qr(commitment, label='commitment QR')
 
 
 def cmd_verify_chunk(path: str, chunk_idx: int):
@@ -385,6 +395,21 @@ def cmd_verify(path: str):
                 print('  On-chain:    ⚠️  root not yet committed')
 
 
+def cmd_qr(data: str, label: str = ''):
+    """Print a QR code for data to the terminal."""
+    if not _HAS_QR:
+        print('  ⚠️  qrcode not installed — pip install qrcode')
+        print(f'  Data: {data}')
+        return
+    qr = qrcode.QRCode(border=1)
+    qr.add_data(data)
+    qr.make(fit=True)
+    if label:
+        print(f'  ── {label} ──')
+    qr.print_ascii(invert=True)
+    print(f'  {data}')
+
+
 def cmd_list():
     entries = load_manifest()
     if not entries:
@@ -399,10 +424,121 @@ def cmd_list():
     print(f'\n  Merkle root: {root}')
 
 
+# ── Interactive shell ────────────────────────────────────────────────────────
+
+class ImgfsShell(cmd.Cmd):
+    intro  = (
+        '\n  imgfs — Bitcoin-anchored media archive\n'
+        '  Type help or ? to list commands. Tab completes filenames.\n'
+        '  Ctrl-D or quit to exit.\n'
+    )
+    prompt = 'imgfs> '
+
+    # ── readline completion ───────────────────────────────────────────────────
+
+    def _complete_manifest(self, text):
+        return [e['name'] for e in load_manifest() if e['name'].startswith(text)]
+
+    def _complete_video_manifest(self, text):
+        return [e['name'] for e in load_manifest()
+                if e.get('type') == 'video' and e['name'].startswith(text)]
+
+    def _complete_files(self, text):
+        import glob
+        return glob.glob(text + '*')
+
+    def complete_add(self, text, line, begidx, endidx):
+        return self._complete_files(text)
+
+    def complete_verify(self, text, line, begidx, endidx):
+        return self._complete_manifest(text) or self._complete_files(text)
+
+    def complete_verify_chunk(self, text, line, begidx, endidx):
+        parts = shlex.split(line[:begidx])
+        if len(parts) == 1:
+            return self._complete_video_manifest(text) or self._complete_files(text)
+        if len(parts) == 2:
+            vfile = parts[1]
+            entry = next((e for e in load_manifest() if e['name'] == vfile), None)
+            if entry:
+                return [str(i) for i in range(entry.get('n_chunks', 1))
+                        if str(i).startswith(text)]
+        return []
+
+    def complete_qr(self, text, line, begidx, endidx):
+        return self._complete_manifest(text) or self._complete_files(text)
+
+    # ── commands ─────────────────────────────────────────────────────────────
+
+    def do_add(self, arg):
+        """add <file> [file ...]  — Add images or video to the archive."""
+        paths = shlex.split(arg)
+        if not paths:
+            print('  Usage: add <file> [file ...]')
+            return
+        cmd_add(paths)
+
+    def do_status(self, _arg):
+        """status  — Show archive status and current Merkle root."""
+        cmd_status()
+
+    def do_commit(self, _arg):
+        """commit  — Commit Merkle root to btcvm ledger (fetches Bitcoin tip)."""
+        cmd_commit()
+
+    def do_list(self, _arg):
+        """list  — List all archived files."""
+        cmd_list()
+
+    def do_verify(self, arg):
+        """verify <file>  — Verify file inclusion with Merkle proof."""
+        parts = shlex.split(arg)
+        if not parts:
+            print('  Usage: verify <file>')
+            return
+        cmd_verify(parts[0])
+
+    def do_verify_chunk(self, arg):
+        """verify_chunk <file> <chunk>  — Prove byte-range inclusion for a video chunk."""
+        parts = shlex.split(arg)
+        if len(parts) < 2:
+            print('  Usage: verify_chunk <file> <chunk_index>')
+            return
+        try:
+            cmd_verify_chunk(parts[0], int(parts[1]))
+        except ValueError:
+            print('  Chunk index must be an integer.')
+
+    def do_qr(self, arg):
+        """qr [hash|file]  — Print QR for a hash, file SHA256, or current Merkle root."""
+        parts = shlex.split(arg)
+        if not parts:
+            cmd_qr(current_root(), label='current Merkle root')
+        elif len(parts[0]) == 64 and all(c in '0123456789abcdef' for c in parts[0]):
+            cmd_qr(parts[0], label='hash')
+        else:
+            path = parts[0]
+            if not os.path.isfile(path):
+                print(f'  ✗ not a file or valid hex hash: {path}')
+                return
+            cmd_qr(sha256_file(path), label=os.path.basename(path))
+
+    def do_quit(self, _arg):
+        """quit  — Exit imgfs shell."""
+        return True
+
+    def do_EOF(self, _arg):
+        print()
+        return True
+
+    def emptyline(self):
+        pass
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description='btcvm image filesystem')
+    parser = argparse.ArgumentParser(description='btcvm media filesystem')
     sub = parser.add_subparsers(dest='cmd')
 
     p_add = sub.add_parser('add', help='Add images or video to the archive')
@@ -411,6 +547,7 @@ def main():
     sub.add_parser('status', help='Show archive status and current Merkle root')
     sub.add_parser('commit', help='Commit Merkle root to btcvm ledger')
     sub.add_parser('list',   help='List all archived files')
+    sub.add_parser('shell',  help='Start interactive imgfs shell')
 
     p_verify = sub.add_parser('verify', help='Verify file inclusion with Merkle proof')
     p_verify.add_argument('path')
@@ -418,6 +555,9 @@ def main():
     p_vc = sub.add_parser('verify-chunk', help='Prove byte-range inclusion for a video chunk')
     p_vc.add_argument('path')
     p_vc.add_argument('chunk', type=int, help='Chunk index (0-based)')
+
+    p_qr = sub.add_parser('qr', help='Print QR code for a hash, file, or current root')
+    p_qr.add_argument('target', nargs='?', help='Hex hash, filename, or omit for current root')
 
     args = parser.parse_args()
 
@@ -433,6 +573,16 @@ def main():
         cmd_verify(args.path)
     elif args.cmd == 'verify-chunk':
         cmd_verify_chunk(args.path, args.chunk)
+    elif args.cmd == 'qr':
+        t = args.target
+        if not t:
+            cmd_qr(current_root(), label='current Merkle root')
+        elif len(t) == 64 and all(c in '0123456789abcdef' for c in t):
+            cmd_qr(t, label='hash')
+        else:
+            cmd_qr(sha256_file(t), label=os.path.basename(t))
+    elif args.cmd == 'shell':
+        ImgfsShell().cmdloop()
     else:
         parser.print_help()
 

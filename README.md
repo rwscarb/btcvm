@@ -35,7 +35,10 @@ The resulting ledger is independently verifiable: anyone with the block hashes (
 | `broadcast.py` | Optional OP_RETURN broadcast via the `bit` library |
 | `main.py` | Orchestrator — runs clock loop, executes VM(s), writes ledger |
 | `verify.py` | Verifies ledger, VDF chain, trace, and fleet Merkle against Bitcoin |
+| `imgfs.py` | Bitcoin-anchored media archive — images and chunked video |
 | `test_vm.py` | Unit tests (VM, VDF, trace, fleet) |
+| `Makefile` | Common tasks: install, test, lint, run, imgfs |
+| `completions/` | Bash and Zsh tab completions for `btcvm` and `imgfs` |
 
 ## VM
 
@@ -55,25 +58,34 @@ Programs are tuples loaded into memory. See `programs.py` for examples.
 
 ## Usage
 
-**Requirements:** Python 3.8+, no dependencies for core operation.
+**Requirements:** Python 3.11+, no runtime dependencies (stdlib only).
 
 ```bash
-# v1 — one entry per Bitcoin block (state hash commitment)
+# Install
+pip install -e .        # editable install
+make install            # same via Makefile
+make dev                # with dev deps (pytest, ruff)
+```
+
+### btcvm clock
+
+```bash
+# v1 — one entry per Bitcoin block
 python3 main.py fibonacci
 
-# v1.2 — VDF sub-clock: 5 sequential-hash ticks per block, one ledger entry each
+# v1.2 — VDF sub-clock: 5 ticks per block
 python3 main.py fibonacci --vdf-ticks 5
 
-# v2 — trace mode: Merkle root over all step hashes replaces state_hash
+# v2 — trace Merkle root replaces state_hash
 python3 main.py fibonacci --trace
 
-# v3 — fleet mode: 4 parallel VMs, single fleet Merkle root per OP_RETURN
+# v3 — fleet of 4 parallel VMs, single fleet root per OP_RETURN
 python3 main.py fibonacci --vms 4
 
 # Everything combined
 python3 main.py fibonacci --vms 4 --vdf-ticks 3 --trace
 
-# Optional OP_RETURN broadcast to Bitcoin
+# Optional: broadcast commitment as OP_RETURN
 pip install bit
 python3 main.py fibonacci --broadcast --wif <your-WIF-key> --network mainnet
 ```
@@ -86,124 +98,234 @@ k = PrivateKey()
 print(k.to_wif(), k.address)
 ```
 
-Fund the address with a small amount (~5000 sats covers ~8 commitments at low fee rates). The `--broadcast` flag is optional — the ledger and verification work without it.
+Fund the address with ~5000 sats (covers ~8 commitments at low fee rates).
 
 **Verifying a ledger:**
 
 ```bash
-# Verify block hashes, commitments, VDF chain, and trace (fast)
-python3 verify.py
-
-# With a trace file
-python3 verify.py --trace-file trace.jsonl
-
-# Also check OP_RETURN presence in blocks (fetches block tx lists)
-python3 verify.py --check-txs
+python3 verify.py                          # block hashes + commitments
+python3 verify.py --trace-file trace.jsonl # include trace verification
+python3 verify.py --check-txs              # also fetch block tx lists
 ```
 
-**v1 ledger entry:**
+### imgfs — Bitcoin-anchored media archive
 
+`imgfs` stores images and video in a content-addressed Merkle tree and commits
+the root to Bitcoin via the btcvm ledger. Images are hashed whole; video files
+are split into 256 KB chunks with a per-file Merkle tree, enabling byte-range
+inclusion proofs.
+
+```
+image.jpg  → SHA256 ──────────────────────────────────┐
+                                                       ├─→ global root → Bitcoin
+video.mp4  → [chunk₀, chunk₁, …, chunkₙ] → file root ┘
+```
+
+```bash
+# Add files (images or video — detected by extension)
+python3 imgfs.py add photo.jpg family.jpg video.mp4
+
+# Show current archive state and Merkle root
+python3 imgfs.py status
+
+# List all archived files
+python3 imgfs.py list
+
+# Commit current Merkle root to the btcvm ledger
+python3 imgfs.py commit
+
+# Then anchor on-chain (optional)
+python3 broadcast.py <commitment>
+
+# Verify a file is in the archive (Merkle inclusion proof)
+python3 imgfs.py verify photo.jpg
+
+# Prove a specific 256 KB chunk of a video is in the archive
+python3 imgfs.py verify-chunk video.mp4 3
+```
+
+**Via Makefile:**
+
+```bash
+make add FILE=photo.jpg
+make verify-file FILE=photo.jpg
+make imgfs-status
+make imgfs-list
+make imgfs-commit
+make imgfs-clean      # remove manifest + ledger
+```
+
+**Environment variables:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `IMGFS_MANIFEST` | `imgfs_manifest.jsonl` | Manifest path |
+| `IMGFS_LEDGER` | `imgfs_ledger.jsonl` | Ledger path |
+| `IMGFS_CHUNK_BYTES` | `262144` (256 KB) | Video chunk size |
+
+**Proof chain for a video chunk:**
+
+```
+chunk N bytes → SHA256 → chunk hash
+                             ↓ Merkle proof (steps: log₂ chunks)
+                         file root  (= global leaf)
+                             ↓ Merkle proof (steps: log₂ files)
+                         global root → committed to Bitcoin
+```
+
+`verify-chunk` outputs all three levels: bytes-on-disk match, per-file proof, global proof.
+
+## Architecture
+
+### VDF sub-clock (v1.2)
+
+Between Bitcoin blocks the VM fires once per VDF tick. Each tick is `STEPS_PER_TICK` sequential SHA256 evaluations seeded from the previous tick's output. Because SHA256 can't be parallelised in this chained form, the ticks represent a minimum sequential cost any verifier must replay.
+
+```
+Bitcoin block hash B_h
+  tick 0: SHA256ᴺ(B_h)    → vdf₀ → VM cycles → commit₀
+  tick 1: SHA256ᴺ(vdf₀)   → vdf₁ → VM cycles → commit₁
+  …
+  Next block B_{h+1} reseeds the chain
+```
+
+### Trace commitment (v2)
+
+Every VM step is recorded as a hash-chained entry:
+`step_hash = SHA256(prev_hash ‖ pc ‖ op ‖ regs_before ‖ regs_after)`.
+A binary Merkle tree over all step hashes produces a single root that
+replaces `state_hash` in the ledger commitment. Any individual step can
+be verified without replaying the full execution. The trace file is
+the witness a ZK prover (RISC Zero, SP1, Cairo) would consume.
+
+### Fleet Merkle root (v3)
+
+N VMs run in parallel each tick. A binary Merkle tree over all N
+commitments produces a single `fleet_root` — one OP_RETURN regardless
+of fleet size.
+
+```
+tick N:
+  VM₀ → commitment₀ ─┐
+  VM₁ → commitment₁ ─┤ Merkle → fleet_root → SHA256(block_hash:fleet_root) → OP_RETURN
+  VM₂ → commitment₂ ─┤
+  VM₃ → commitment₃ ─┘
+```
+
+## Ledger formats
+
+**v1 entry:**
 ```json
 {
   "block_height": 961224,
   "block_hash": "000000000000...",
   "vdf_tick": 0,
   "vm_ticks": 10,
-  "cycles_this_tick": 10,
   "halted": false,
   "registers": [1, 1, 1, 20, 1, 0, 0, 0],
   "state_hash": "a3f9c2b1...",
-  "commitment": "88d6f091...",
-  "tx_hash": "3969fe2c..."
+  "commitment": "88d6f091..."
 }
 ```
 
-**v1.2 entry** (VDF active) adds:
-
+**v1.2 additions** (VDF active):
 ```json
 {
   "vdf_tick": 2,
-  "vdf_input": "prev_tick_output_hex...",
-  "vdf_hash": "this_tick_output_hex...",
+  "vdf_input": "prev_tick_output...",
+  "vdf_hash": "this_tick_output...",
   "commitment": "SHA256(block_hash:vdf_hash:state_hash)"
 }
 ```
 
-**v2 entry** (trace active) adds:
-
+**v2 additions** (trace active):
 ```json
 {
-  "trace_root": "merkle_root_over_all_steps_hex...",
+  "trace_root": "merkle_root_over_all_steps...",
   "trace_steps": 42,
   "commitment": "SHA256(block_hash:trace_root)"
 }
 ```
 
-**v3 entry** (fleet active) replaces per-VM fields with:
-
+**v3** (fleet active) replaces per-VM fields with:
 ```json
 {
   "fleet_size": 4,
-  "fleet_root": "merkle_root_over_all_vm_commitments...",
+  "fleet_root": "merkle_root_over_vm_commitments...",
   "commitment": "SHA256(block_hash:fleet_root)",
   "vms": [
-    {"vm_id": 0, "program": "fibonacci", "vm_ticks": 10, "cycles": 10,
-     "halted": false, "registers": [...], "state_hash": "..."},
-    {"vm_id": 1, ...},
-    {"vm_id": 2, ...},
-    {"vm_id": 3, ...}
+    {"vm_id": 0, "program": "fibonacci", "halted": false, "registers": [...], "state_hash": "..."},
+    ...
   ]
 }
 ```
 
-## Architecture
-
-### VDF sub-clock (v1.2)
-
-Between Bitcoin blocks the VM no longer fires once and waits — instead it fires once per VDF tick. Each tick is `STEPS_PER_TICK` sequential SHA256 evaluations seeded from the previous tick's output (and the first tick is seeded from the Bitcoin block hash). Because SHA256 can't be parallelised in this chained form, the ticks represent a minimum sequential cost that any verifier must replay.
-
-```
-Bitcoin block hash B_h
-  VDF tick 0:  SHA256^N(B_h) → vdf_0  →  VM cycles  →  commit_0
-  VDF tick 1:  SHA256^N(vdf_0) → vdf_1  →  VM cycles  →  commit_1
-  ...
-  Next Bitcoin block B_{h+1} reseeds the VDF
+**imgfs ledger entry:**
+```json
+{
+  "ts": "2026-08-17T20:37:00Z",
+  "block_height": 961301,
+  "block_hash": "000000000000...",
+  "merkle_root": "b699603c...",
+  "commitment": "9dc75674...",
+  "image_count": 3
+}
 ```
 
-### Trace commitment (v2)
+## Tab completions
 
-Every VM step is recorded as a hash-chained entry: `step_hash = SHA256(prev_hash || pc || op || regs_before || regs_after)`. A binary Merkle tree over all step hashes produces a single root that replaces `state_hash` in the ledger commitment.
-
-This means:
-- Anyone can verify any individual step without replaying the entire execution
-- The trace file is the witness a ZK prover (RISC Zero, SP1, Cairo) would consume to generate a succinct proof
-
-### Fleet Merkle root (v3)
-
-N VMs run in parallel each tick. Each contributes a commitment (state_hash or trace_root). A binary Merkle tree over all N commitments produces a single `fleet_root` — one value, one OP_RETURN, regardless of fleet size.
-
-```
-tick N:
-  VM_0 → commitment_0 ─┐
-  VM_1 → commitment_1 ─┤ Merkle → fleet_root → SHA256(block_hash:fleet_root) → OP_RETURN
-  VM_2 → commitment_2 ─┤
-  VM_3 → commitment_3 ─┘
+```bash
+make completion
 ```
 
-Verification recomputes the fleet Merkle from per-VM hashes stored in the ledger entry and checks it against the recorded `fleet_root`, without re-executing any VM.
+Installs Bash and Zsh completions for both `btcvm` and `imgfs`:
+- `btcvm` — flags and values (`--vdf-ticks`, `--vms`, etc.)
+- `imgfs add` — any file
+- `imgfs verify` — filenames from the manifest
+- `imgfs verify-chunk` — video names, then chunk indices from the manifest
+
+For Zsh, add to `~/.zshrc` if not already present:
+```zsh
+fpath=(~/.zsh/completions $fpath)
+autoload -Uz compinit && compinit
+```
+
+## Makefile targets
+
+```
+make install        pip install -e .
+make dev            install with dev deps
+make test           run pytest
+make lint           ruff check
+make fix            ruff --fix
+make run            btcvm one block
+make run-vdf        btcvm with VDF sub-clock
+make run-trace      btcvm with trace Merkle
+make run-fleet      btcvm fleet of 4 VMs
+make verify         verify ledger.jsonl
+make imgfs-status   show archive status
+make imgfs-list     list archived files
+make imgfs-commit   commit Merkle root
+make imgfs-clean    remove manifest + ledger
+make add FILE=…     add file to imgfs
+make verify-file FILE=…  verify inclusion
+make completion     install shell completions
+```
 
 ## Roadmap
 
 - ✅ **v1** — Bitcoin-clocked register machine, local ledger, optional OP_RETURN
-- ✅ **v1.1** — Ledger verification against block hashes and OP_RETURN (`--check-txs`)
+- ✅ **v1.1** — Ledger verification against block hashes and OP_RETURN
 - ✅ **v1.2** — VDF sub-clock (`--vdf-ticks N`)
 - ✅ **v2** — Trace commitment / Merkle root (`--trace`)
-- ✅ **v3** — Fleet Merkle tree: N parallel VMs, single OP_RETURN (`--vms N`)
+- ✅ **v3** — Fleet Merkle: N parallel VMs, single OP_RETURN (`--vms N`)
+- ✅ **imgfs** — Bitcoin-anchored media archive with chunked video and inclusion proofs
 
 ## Tests
 
 ```bash
-pip install pytest
+make test
+# or
 python3 -m pytest test_vm.py -v
 ```
 
