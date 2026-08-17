@@ -20,7 +20,7 @@ _btcvm_complete() {
     COMPREPLY=( $(compgen -W "$main_commands" -- "$cur") )
 }
 
-_imgfs_complete() {
+_ott_complete() {
     local cur prev words cword
     _init_completion || return
 
@@ -39,12 +39,12 @@ _imgfs_complete() {
             ;;
         verify)
             # Complete files in manifest if available
-            if [ -f imgfs_manifest.jsonl ]; then
+            if [ -f ott_manifest.jsonl ]; then
                 local names
                 names=$(python3 -c "
 import json
 try:
-    with open('imgfs_manifest.jsonl') as f:
+    with open('ott_manifest.jsonl') as f:
         for line in f:
             e = json.loads(line.strip())
             print(e.get('name',''))
@@ -58,12 +58,12 @@ except: pass
         verify-chunk)
             if [ "$cword" -eq 2 ]; then
                 # Complete video filenames from manifest
-                if [ -f imgfs_manifest.jsonl ]; then
+                if [ -f ott_manifest.jsonl ]; then
                     local names
                     names=$(python3 -c "
 import json
 try:
-    with open('imgfs_manifest.jsonl') as f:
+    with open('ott_manifest.jsonl') as f:
         for line in f:
             e = json.loads(line.strip())
             if e.get('type') == 'video':
@@ -81,7 +81,7 @@ except: pass
                 n_chunks=$(python3 -c "
 import json
 try:
-    with open('imgfs_manifest.jsonl') as f:
+    with open('ott_manifest.jsonl') as f:
         for line in f:
             e = json.loads(line.strip())
             if e.get('name') == '$vfile':
@@ -99,5 +99,5 @@ except: pass
 }
 
 complete -F _btcvm_complete btcvm
-complete -F _imgfs_complete imgfs.py
-complete -F _imgfs_complete imgfs
+complete -F _ott_complete ott.py
+complete -F _ott_complete ott

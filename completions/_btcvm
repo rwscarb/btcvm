@@ -1,5 +1,5 @@
-#compdef btcvm imgfs imgfs.py
-# btcvm + imgfs zsh tab completions
+#compdef btcvm ott ott.py
+# btcvm + ott zsh tab completions
 # Install:
 #   cp completions/_btcvm ~/.zsh/completions/_btcvm
 #   Add to ~/.zshrc:  fpath=(~/.zsh/completions $fpath)
@@ -19,15 +19,15 @@ _btcvm() {
     _arguments $opts
 }
 
-# ── imgfs helpers ─────────────────────────────────────────────────────────────
+# ── ott helpers ─────────────────────────────────────────────────────────────
 
-_imgfs_manifest_names() {
+_ott_manifest_names() {
     local -a names
-    if [[ -f imgfs_manifest.jsonl ]]; then
+    if [[ -f ott_manifest.jsonl ]]; then
         names=( ${(f)"$(python3 -c "
 import json
 try:
-    with open('imgfs_manifest.jsonl') as f:
+    with open('ott_manifest.jsonl') as f:
         for line in f:
             line = line.strip()
             if line:
@@ -39,13 +39,13 @@ except: pass
     compadd -a names
 }
 
-_imgfs_video_names() {
+_ott_video_names() {
     local -a names
-    if [[ -f imgfs_manifest.jsonl ]]; then
+    if [[ -f ott_manifest.jsonl ]]; then
         names=( ${(f)"$(python3 -c "
 import json
 try:
-    with open('imgfs_manifest.jsonl') as f:
+    with open('ott_manifest.jsonl') as f:
         for line in f:
             line = line.strip()
             if line:
@@ -58,15 +58,15 @@ except: pass
     compadd -a names
 }
 
-_imgfs_chunk_indices() {
+_ott_chunk_indices() {
     local vfile="$1"
     local -a indices
-    if [[ -f imgfs_manifest.jsonl ]]; then
+    if [[ -f ott_manifest.jsonl ]]; then
         local n
         n=$(python3 -c "
 import json
 try:
-    with open('imgfs_manifest.jsonl') as f:
+    with open('ott_manifest.jsonl') as f:
         for line in f:
             line = line.strip()
             if line:
@@ -82,9 +82,9 @@ except: pass
     compadd -a indices
 }
 
-# ── imgfs main completion ─────────────────────────────────────────────────────
+# ── ott main completion ─────────────────────────────────────────────────────
 
-_imgfs() {
+_ott() {
     local state
 
     _arguments \
@@ -111,13 +111,13 @@ _imgfs() {
                     _files
                     ;;
                 verify)
-                    _imgfs_manifest_names
+                    _ott_manifest_names
                     ;;
                 verify-chunk)
                     if (( CURRENT == 3 )); then
-                        _imgfs_video_names
+                        _ott_video_names
                     elif (( CURRENT == 4 )); then
-                        _imgfs_chunk_indices "${words[3]}"
+                        _ott_chunk_indices "${words[3]}"
                     fi
                     ;;
             esac
@@ -126,5 +126,5 @@ _imgfs() {
 }
 
 compdef _btcvm btcvm
-compdef _imgfs imgfs
-compdef _imgfs imgfs.py
+compdef _ott ott
+compdef _ott ott.py

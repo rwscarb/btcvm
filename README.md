@@ -35,10 +35,10 @@ The resulting ledger is independently verifiable: anyone with the block hashes (
 | `broadcast.py` | Optional OP_RETURN broadcast via the `bit` library |
 | `main.py` | Orchestrator — runs clock loop, executes VM(s), writes ledger |
 | `verify.py` | Verifies ledger, VDF chain, trace, and fleet Merkle against Bitcoin |
-| `imgfs.py` | Bitcoin-anchored media archive — images and chunked video |
+| `ott.py` | Bitcoin-anchored media archive — images and chunked video |
 | `test_vm.py` | Unit tests (VM, VDF, trace, fleet) |
-| `Makefile` | Common tasks: install, test, lint, run, imgfs |
-| `completions/` | Bash and Zsh tab completions for `btcvm` and `imgfs` |
+| `Makefile` | Common tasks: install, test, lint, run, ott |
+| `completions/` | Bash and Zsh tab completions for `btcvm` and `ott` |
 
 ## VM
 
@@ -108,9 +108,9 @@ python3 verify.py --trace-file trace.jsonl # include trace verification
 python3 verify.py --check-txs              # also fetch block tx lists
 ```
 
-### imgfs — Bitcoin-anchored media archive
+### ott — Bitcoin-anchored media archive
 
-`imgfs` stores images and video in a content-addressed Merkle tree and commits
+`ott` stores images and video in a content-addressed Merkle tree and commits
 the root to Bitcoin via the btcvm ledger. Images are hashed whole; video files
 are split into 256 KB chunks with a per-file Merkle tree, enabling byte-range
 inclusion proofs.
@@ -123,25 +123,25 @@ video.mp4  → [chunk₀, chunk₁, …, chunkₙ] → file root ┘
 
 ```bash
 # Add files (images or video — detected by extension)
-python3 imgfs.py add photo.jpg family.jpg video.mp4
+python3 ott.py add photo.jpg family.jpg video.mp4
 
 # Show current archive state and Merkle root
-python3 imgfs.py status
+python3 ott.py status
 
 # List all archived files
-python3 imgfs.py list
+python3 ott.py list
 
 # Commit current Merkle root to the btcvm ledger
-python3 imgfs.py commit
+python3 ott.py commit
 
 # Then anchor on-chain (optional)
 python3 broadcast.py <commitment>
 
 # Verify a file is in the archive (Merkle inclusion proof)
-python3 imgfs.py verify photo.jpg
+python3 ott.py verify photo.jpg
 
 # Prove a specific 256 KB chunk of a video is in the archive
-python3 imgfs.py verify-chunk video.mp4 3
+python3 ott.py verify-chunk video.mp4 3
 ```
 
 **Via Makefile:**
@@ -149,19 +149,19 @@ python3 imgfs.py verify-chunk video.mp4 3
 ```bash
 make add FILE=photo.jpg
 make verify-file FILE=photo.jpg
-make imgfs-status
-make imgfs-list
-make imgfs-commit
-make imgfs-clean      # remove manifest + ledger
+make ott-status
+make ott-list
+make ott-commit
+make ott-clean      # remove manifest + ledger
 ```
 
 **Environment variables:**
 
 | Variable | Default | Description |
 |---|---|---|
-| `IMGFS_MANIFEST` | `imgfs_manifest.jsonl` | Manifest path |
-| `IMGFS_LEDGER` | `imgfs_ledger.jsonl` | Ledger path |
-| `IMGFS_CHUNK_BYTES` | `262144` (256 KB) | Video chunk size |
+| `OTT_MANIFEST` | `ott_manifest.jsonl` | Manifest path |
+| `OTT_LEDGER` | `ott_ledger.jsonl` | Ledger path |
+| `OTT_CHUNK_BYTES` | `262144` (256 KB) | Video chunk size |
 
 **Proof chain for a video chunk:**
 
@@ -260,7 +260,7 @@ tick N:
 }
 ```
 
-**imgfs ledger entry:**
+**ott ledger entry:**
 ```json
 {
   "ts": "2026-08-17T20:37:00Z",
@@ -278,11 +278,11 @@ tick N:
 make completion
 ```
 
-Installs Bash and Zsh completions for both `btcvm` and `imgfs`:
+Installs Bash and Zsh completions for both `btcvm` and `ott`:
 - `btcvm` — flags and values (`--vdf-ticks`, `--vms`, etc.)
-- `imgfs add` — any file
-- `imgfs verify` — filenames from the manifest
-- `imgfs verify-chunk` — video names, then chunk indices from the manifest
+- `ott add` — any file
+- `ott verify` — filenames from the manifest
+- `ott verify-chunk` — video names, then chunk indices from the manifest
 
 For Zsh, add to `~/.zshrc` if not already present:
 ```zsh
@@ -303,11 +303,11 @@ make run-vdf        btcvm with VDF sub-clock
 make run-trace      btcvm with trace Merkle
 make run-fleet      btcvm fleet of 4 VMs
 make verify         verify ledger.jsonl
-make imgfs-status   show archive status
-make imgfs-list     list archived files
-make imgfs-commit   commit Merkle root
-make imgfs-clean    remove manifest + ledger
-make add FILE=…     add file to imgfs
+make ott-status   show archive status
+make ott-list     list archived files
+make ott-commit   commit Merkle root
+make ott-clean    remove manifest + ledger
+make add FILE=…     add file to ott
 make verify-file FILE=…  verify inclusion
 make completion     install shell completions
 ```
@@ -319,7 +319,7 @@ make completion     install shell completions
 - ✅ **v1.2** — VDF sub-clock (`--vdf-ticks N`)
 - ✅ **v2** — Trace commitment / Merkle root (`--trace`)
 - ✅ **v3** — Fleet Merkle: N parallel VMs, single OP_RETURN (`--vms N`)
-- ✅ **imgfs** — Bitcoin-anchored media archive with chunked video and inclusion proofs
+- ✅ **ott** — Bitcoin-anchored media archive with chunked video and inclusion proofs
 
 ## Tests
 

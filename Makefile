@@ -2,7 +2,7 @@
 
 PYTHON     ?= python3
 VENV_NAME  ?= btcvm
-IMGFS      := $(PYTHON) imgfs.py
+OTT      := $(PYTHON) ott.py
 BTCVM      := $(PYTHON) main.py
 
 help:
@@ -25,11 +25,11 @@ help:
 	@echo "  make run-fleet     Run fleet of VMs"
 	@echo "  make verify        Verify ledger against Bitcoin"
 	@echo ""
-	@echo "imgfs:"
-	@echo "  make imgfs-status  Show archive status"
-	@echo "  make imgfs-list    List archived files"
-	@echo "  make imgfs-commit  Commit Merkle root to ledger"
-	@echo "  make imgfs-clean   Remove manifest and ledger"
+	@echo "ott:"
+	@echo "  make ott-status  Show archive status"
+	@echo "  make ott-list    List archived files"
+	@echo "  make ott-commit  Commit Merkle root to ledger"
+	@echo "  make ott-clean   Remove manifest and ledger"
 	@echo ""
 	@echo "  make add FILE=path/to/file.jpg   Add file to archive"
 	@echo "  make verify-file FILE=path       Verify file inclusion"
@@ -47,8 +47,14 @@ completion:
 	@cp completions/btcvm.bash ~/.local/share/bash-completion/completions/btcvm
 	@mkdir -p ~/.zsh/completions
 	@cp completions/_btcvm ~/.zsh/completions/_btcvm
-	@echo "Bash: source ~/.local/share/bash-completion/completions/btcvm"
-	@echo "Zsh:  fpath=(~/.zsh/completions \$$fpath) in ~/.zshrc, then compinit"
+	@# Append zshrc lines only if not already present
+	@grep -qF 'zsh/completions' ~/.zshrc 2>/dev/null || echo 'fpath=(~/.zsh/completions $$fpath)' >> ~/.zshrc
+	@grep -qF 'autoload -Uz compinit' ~/.zshrc 2>/dev/null || echo 'autoload -Uz compinit && compinit' >> ~/.zshrc
+	@# Bash: source line in .bashrc if not present
+	@grep -qF 'bash-completion/completions/btcvm' ~/.bashrc 2>/dev/null || echo 'source ~/.local/share/bash-completion/completions/btcvm' >> ~/.bashrc
+	@echo "✅ Completions installed."
+	@echo "   Bash: restart shell or: source ~/.bashrc"
+	@echo "   Zsh:  restart shell or: source ~/.zshrc"
 
 # ── Tests + lint ──────────────────────────────────────────────────────────────
 
@@ -78,32 +84,32 @@ run-fleet:
 verify:
 	$(PYTHON) verify.py ledger.jsonl
 
-# ── imgfs ─────────────────────────────────────────────────────────────────────
+# ── ott ─────────────────────────────────────────────────────────────────────
 
-imgfs-status:
-	$(IMGFS) status
+ott-status:
+	$(OTT) status
 
-imgfs-list:
-	$(IMGFS) list
+ott-list:
+	$(OTT) list
 
-imgfs-commit:
-	$(IMGFS) commit
+ott-commit:
+	$(OTT) commit
 
-imgfs-clean:
-	@rm -f imgfs_manifest.jsonl imgfs_ledger.jsonl
-	@echo "imgfs manifest and ledger removed."
+ott-clean:
+	@rm -f ott_manifest.jsonl ott_ledger.jsonl
+	@echo "ott manifest and ledger removed."
 
 add:
 ifndef FILE
 	$(error FILE is not set. Usage: make add FILE=path/to/file)
 endif
-	$(IMGFS) add $(FILE)
+	$(OTT) add $(FILE)
 
 verify-file:
 ifndef FILE
 	$(error FILE is not set. Usage: make verify-file FILE=path/to/file)
 endif
-	$(IMGFS) verify $(FILE)
+	$(OTT) verify $(FILE)
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 

@@ -25,6 +25,7 @@ dependencies = []
 
 [project.scripts]
 btcvm = "main:main"
+ott = "ott:main"
 
 [project.optional-dependencies]
 dev = [
@@ -39,7 +40,7 @@ python_files = ["test_*.py"]
 python_functions = ["test_*"]
 
 [tool.setuptools]
-py-modules = ["main", "vm", "clock", "trace", "fleet", "vdf", "verify", "broadcast", "asm", "programs", "imgfs"]
+py-modules = ["main", "vm", "clock", "trace", "fleet", "vdf", "verify", "broadcast", "asm", "programs", "imgfs", "ott"]
 
 [tool.ruff]
 line-length = 100
