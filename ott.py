@@ -631,6 +631,13 @@ def cmd_find(name_or_hash: str, search_root: str | None = None):
     print('  Updated last_path in manifest')
 
 
+def cmd_migrate(path: str | None = None):
+    """Import old flat ott_manifest/imgfs_manifest into existing .ott/ store."""
+    store = get_store()
+    search = os.path.abspath(path or store.root_dir)
+    _do_migrate(store, search)
+
+
 def cmd_mv(name_or_hash: str, new_path: str):
     """Update last_path (and name if basename changed) for a manifest entry."""
     store = get_store()
@@ -798,6 +805,11 @@ class OttShell(cmd.Cmd):
             return
         _run(cmd_find, parts[0], parts[1] if len(parts) > 1 else None)
 
+    def do_migrate(self, arg):
+        """migrate [path]  — Import old ott_manifest.jsonl / imgfs_manifest.jsonl into .ott/"""
+        parts = shlex.split(arg)
+        _run(cmd_migrate, parts[0] if parts else None)
+
     def do_mv(self, arg):
         """mv <name> <new_path>  — Update last_path (and name) for an entry."""
         parts = shlex.split(arg)
@@ -836,6 +848,7 @@ class OttShell(cmd.Cmd):
 
     # ── aliases ───────────────────────────────────────────────────────────────
 
+    def do_l(self, a):     """l     — list""";           self.do_list(a)
     def do_ls(self, a):    """ls    — list""";           self.do_list(a)
     def do_st(self, a):    """st    — status""";         self.do_status(a)
     def do_a(self, a):     """a     — add""";             self.do_add(a)
@@ -857,6 +870,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest='cmd')
+
+    p_migrate = sub.add_parser('migrate', help='Import old flat manifest/ledger into .ott/')
+    p_migrate.add_argument('path', nargs='?', default=None)
 
     p_init = sub.add_parser('init', help='Create .ott/ archive in current directory')
     p_init.add_argument('path', nargs='?', default='.')
@@ -892,7 +908,9 @@ def main():
     args = parser.parse_args()
 
     try:
-        if args.cmd == 'init':
+        if args.cmd == 'migrate':
+            cmd_migrate(args.path)
+        elif args.cmd == 'init':
             cmd_init(args.path, args.migrate)
         elif args.cmd == 'add':
             cmd_add(args.paths)
