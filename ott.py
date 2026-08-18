@@ -507,23 +507,26 @@ def cmd_list():
     if not entries:
         print('  Archive is empty.')
         return
-    print(f'  {"#":<4} {"T":<2} {"path":<44} {"sha256":<18} {"size":>10}  {"  "}')
-    print('  ' + '-' * 96)
+    print(f'  {"#":<4} {"T":<2} {"path":<44} {"sha256":<18} {"size":>14}  {"loc":<3} {"obj":<3}')
+    print('  ' + '-' * 100)
     for i, e in enumerate(entries):
         etype = e.get('type', 'image')
         t = {'video': 'V', 'repo': 'R'}.get(etype, 'I')
         is_repo = etype == 'repo'
         path_ok = (os.path.isdir if is_repo else os.path.isfile)(e.get('last_path', ''))
-        ok = '✅' if path_ok else '⚠️ '
-        backed = '📦' if (not is_repo and store.has_object(e['sha256'])) else '  '
+        # ✅/❌/📦 are all single-codepoint, consistently double-width emoji across
+        # terminals. ⚠️ (warning sign + variation selector) is not — different
+        # terminals render it at different widths, which ragged the columns.
+        ok = '✅ ' if path_ok else '❌ '
+        backed = '📦' if (not is_repo and store.has_object(e['sha256'])) else '·'
         display = e.get('orig_path') or e['name']
         if len(display) > 44:
             display = '…' + display[-43:]
         print(f'  {i:<4} {t:<2} {display:<44} {e["sha256"][:16]}…  '
-              f'{e.get("size", 0):>10,}  {ok}{backed}')
+              f'{e.get("size", 0):>14,}  {ok} {backed}')
     print(f'\n  Merkle root: {store.current_root()}')
-    print('  T: I=image V=video R=repo  ✅=at last_path  ⚠️ =path missing (run ott find)  '
-          '📦=archive copy stored (run ott backfill)')
+    print('  T: I=image V=video R=repo  loc: ✅=at last_path ❌=path missing (run ott find)  '
+          'obj: 📦=archive copy stored ·=none (run ott backfill)')
 
 
 def cmd_commit():
