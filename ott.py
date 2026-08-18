@@ -700,7 +700,7 @@ def cmd_ls(path_filter: str | None = None, show_all: bool = False, tag: str | No
     print(f'  /{prefix}' if prefix else '  /')
     if tag:
         print(f'  (filtered to tag: {tag})')
-    print(f'  {"T":<2} {"name":<44} {"size":>14}  {"loc":<3} {"obj":<3}')
+    print(f'  {"T":<2} {"name":<44} {"sha256":<10} {"size":>14}  {"loc":<3} {"obj":<3}')
     print('  ' + '-' * 90)
     for name in sorted(dirs):
         sub = dirs[name]
@@ -709,7 +709,7 @@ def cmd_ls(path_filter: str | None = None, show_all: bool = False, tag: str | No
         ok = '✅ ' if n_missing == 0 else '❌ '
         n = len(sub)
         size_str = _fmt_size(total_size, human)
-        print(f'  {"D":<2} {name + "/":<44} {size_str:>14}  {ok} ·   '
+        print(f'  {"D":<2} {name + "/":<44} {"·":<10} {size_str:>14}  {ok} ·   '
               f'({n} item{"s" if n != 1 else ""})')
     for e in sorted(files, key=lambda e: e['name']):
         etype = e.get('type', 'image')
@@ -719,7 +719,7 @@ def cmd_ls(path_filter: str | None = None, show_all: bool = False, tag: str | No
         if len(display) > 44:
             display = '…' + display[-43:]
         size_str = _fmt_size(e.get('size', 0), human)
-        print(f'  {t:<2} {display:<44} {size_str:>14}  {ok} {backed}')
+        print(f'  {t:<2} {display:<44} {e["sha256"][:8]}…  {size_str:>14}  {ok} {backed}')
 
     if not show_all:
         vis_missing_only = _visibility_predicate(False, tag)
