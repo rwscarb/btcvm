@@ -21,8 +21,11 @@ Commands:
     ott add -r ./dvds                add a directory tree recursively
     ott status                       current state + Merkle root
     ott list                         list archived files (full flat dump)
-    ott ls [dir]                     one-level, unix-style hierarchy view
-    ott tree [dir]                   recursive tree view of the hierarchy
+    ott ls [-a] [-t tag] [dir]       one-level, unix-style hierarchy view
+    ott tree [-a] [-t tag] [dir]     recursive tree view of the hierarchy
+    ott tag add /84.*VOB/ family     bulk-tag entries by regex on archive path
+    ott tag rm <pattern> <tagname>   remove a tag from matching entries
+    ott tag list [pattern]           all tags with counts, or tags on a match
     ott commit                       commit Merkle root to Bitcoin ledger
     ott verify photo.jpg             Merkle inclusion proof
     ott verify-chunk video.mp4 3     byte-range inclusion proof (video)
@@ -39,6 +42,7 @@ import cmd
 import hashlib
 import json
 import os
+import re
 import shlex
 import sys
 import time
@@ -553,12 +557,13 @@ def _is_missing(e: dict) -> bool:
 
 
 def _group_children(entries: list[dict], prefix: str,
-                    show_missing: bool = True) -> tuple[dict[str, list], list[dict]]:
+                    predicate=None) -> tuple[dict[str, list], list[dict]]:
     """Split entries into (dirs, files) directly under prefix ('' = archive root).
     dirs: {dirname: [entries under it, at any depth]}
     files: [entries whose virtual path sits directly at this level]
-    When show_missing is False, missing files are dropped and directories left
-    with no visible entries afterward are dropped entirely.
+    predicate(entry) -> bool decides whether an entry is visible; None shows
+    everything. Directories left with no visible entries after filtering are
+    dropped entirely.
     """
     prefix_parts = [p for p in prefix.split('/') if p] if prefix else []
     dirs: dict[str, list] = {}
@@ -571,17 +576,33 @@ def _group_children(entries: list[dict], prefix: str,
         if not rest:
             continue
         if len(rest) == 1:
-            if show_missing or not _is_missing(e):
+            if predicate is None or predicate(e):
                 files.append(e)
         else:
             dirs.setdefault(rest[0], []).append(e)
-    if not show_missing:
-        dirs = {name: [x for x in sub if not _is_missing(x)] for name, sub in dirs.items()}
+    if predicate is not None:
+        dirs = {name: [x for x in sub if predicate(x)] for name, sub in dirs.items()}
         dirs = {name: sub for name, sub in dirs.items() if sub}
     return dirs, files
 
 
-def cmd_ls(path_filter: str | None = None, show_all: bool = False):
+def _visibility_predicate(show_all: bool, tag: str | None):
+    """Build the (entry) -> bool filter shared by ls/tree: hides missing entries
+    unless show_all, and restricts to entries carrying `tag` when given.
+    Returns None when nothing needs filtering (show_all and no tag)."""
+    if show_all and not tag:
+        return None
+
+    def pred(e: dict) -> bool:
+        if not show_all and _is_missing(e):
+            return False
+        if tag and tag not in (e.get('tags') or []):
+            return False
+        return True
+    return pred
+
+
+def cmd_ls(path_filter: str | None = None, show_all: bool = False, tag: str | None = None):
     """One-level, unix-`ls`-style view of the archive hierarchy (orig_path-based).
     Entries whose file/repo is missing at last_path are hidden unless show_all.
     Use `ott list`/`l` for the full flat dump with every path in one table.
@@ -593,18 +614,21 @@ def cmd_ls(path_filter: str | None = None, show_all: bool = False):
         return
 
     prefix = (path_filter or '').strip('/')
-    dirs, files = _group_children(entries, prefix, show_missing=show_all)
+    pred = _visibility_predicate(show_all, tag)
+    dirs, files = _group_children(entries, prefix, pred)
     if not dirs and not files:
-        if not show_all:
-            all_dirs, all_files = _group_children(entries, prefix, show_missing=True)
+        if pred is not None:
+            all_dirs, all_files = _group_children(entries, prefix, None)
             if all_dirs or all_files:
-                print(f'  Nothing present under /{prefix} — everything here is missing '
-                      f'at last_path. Run `ott ls -a{" " + prefix if prefix else ""}` to see it.')
+                reason = f'tag {tag!r}' if tag else 'missing at last_path'
+                print(f'  Nothing visible under /{prefix} with current filters ({reason} excluded it).')
                 return
         print(f'  ✗ nothing found under /{prefix}' if prefix else '  Archive is empty.')
         return
 
     print(f'  /{prefix}' if prefix else '  /')
+    if tag:
+        print(f'  (filtered to tag: {tag})')
     print(f'  {"T":<2} {"name":<44} {"size":>14}  {"loc":<3} {"obj":<3}')
     print('  ' + '-' * 90)
     for name in sorted(dirs):
@@ -625,17 +649,21 @@ def cmd_ls(path_filter: str | None = None, show_all: bool = False):
         print(f'  {t:<2} {display:<44} {e.get("size", 0):>14,}  {ok} {backed}')
 
     if not show_all:
-        all_dirs, all_files = _group_children(entries, prefix, show_missing=True)
-        hidden = (len(all_dirs) - len(dirs)) + (len(all_files) - len(files))
+        vis_missing_only = _visibility_predicate(False, tag)
+        all_with_tag_only = _visibility_predicate(True, tag)
+        d1, f1 = _group_children(entries, prefix, vis_missing_only)
+        d2, f2 = _group_children(entries, prefix, all_with_tag_only)
+        hidden = (len(d2) - len(d1)) + (len(f2) - len(f1))
         if hidden:
+            flag = f'-a --tag {tag}' if tag else '-a'
             print(f'\n  ({hidden} missing item{"s" if hidden != 1 else ""} hidden — '
-                  f'use `ott ls -a{" " + prefix if prefix else ""}` to show)')
+                  f'use `ott ls {flag}{" " + prefix if prefix else ""}` to show)')
 
     child = f'{prefix}/<name>' if prefix else '<name>'
     print(f'\n  Drill in with: ott ls {child}   or see everything at once with: ott list')
 
 
-def cmd_tree(path_filter: str | None = None, show_all: bool = False):
+def cmd_tree(path_filter: str | None = None, show_all: bool = False, tag: str | None = None):
     """Recursive tree view of the archive hierarchy, in the spirit of unix `tree`.
     Entries whose file/repo is missing at last_path are hidden unless show_all.
     """
@@ -646,24 +674,27 @@ def cmd_tree(path_filter: str | None = None, show_all: bool = False):
         return
 
     prefix = (path_filter or '').strip('/')
-    dirs, files = _group_children(entries, prefix, show_missing=show_all)
+    pred = _visibility_predicate(show_all, tag)
+    dirs, files = _group_children(entries, prefix, pred)
     if not dirs and not files:
-        if not show_all:
-            all_dirs, all_files = _group_children(entries, prefix, show_missing=True)
+        if pred is not None:
+            all_dirs, all_files = _group_children(entries, prefix, None)
             if all_dirs or all_files:
-                print(f'  Nothing present under /{prefix} — everything here is missing '
-                      f'at last_path. Run `ott tree -a{" " + prefix if prefix else ""}` to see it.')
+                reason = f'tag {tag!r}' if tag else 'missing at last_path'
+                print(f'  Nothing visible under /{prefix} with current filters ({reason} excluded it).')
                 return
         print(f'  ✗ nothing found under /{prefix}' if prefix else '  Archive is empty.')
         return
 
     print(f'  /{prefix}' if prefix else '  /')
+    if tag:
+        print(f'  (filtered to tag: {tag})')
     counts = {'dirs': 0, 'files': 0, 'hidden': 0}
 
     def _walk(cur_prefix: str, indent: str):
-        d, f = _group_children(entries, cur_prefix, show_missing=show_all)
+        d, f = _group_children(entries, cur_prefix, pred)
         if not show_all:
-            all_d, all_f = _group_children(entries, cur_prefix, show_missing=True)
+            all_d, all_f = _group_children(entries, cur_prefix, _visibility_predicate(True, tag))
             counts['hidden'] += (len(all_d) - len(d)) + (len(all_f) - len(f))
         items = [('D', name) for name in sorted(d)] + \
                 [('F', e) for e in sorted(f, key=lambda e: e['name'])]
@@ -685,10 +716,101 @@ def cmd_tree(path_filter: str | None = None, show_all: bool = False):
     _walk(prefix, '')
     hidden_note = ''
     if not show_all and counts['hidden']:
+        flag = f'-a --tag {tag}' if tag else '-a'
         hidden_note = (f"  ({counts['hidden']} missing item"
-                        f"{'s' if counts['hidden'] != 1 else ''} hidden — use `ott tree -a` to show)")
+                        f"{'s' if counts['hidden'] != 1 else ''} hidden — use `ott tree {flag}` to show)")
     print(f"\n  {counts['dirs']} director{'y' if counts['dirs'] == 1 else 'ies'}, "
           f"{counts['files']} file{'s' if counts['files'] != 1 else ''}{hidden_note}")
+
+
+def _compile_tag_pattern(pattern: str):
+    """Compile a bulk-tag match pattern. Accepts /regex/ (slash-delimited, like
+    grep/sed) or a bare regex; either way it's matched with re.search against
+    the archive path (orig_path, falling back to name)."""
+    if len(pattern) >= 2 and pattern.startswith('/') and pattern.endswith('/'):
+        pattern = pattern[1:-1]
+    try:
+        return re.compile(pattern)
+    except re.error as e:
+        raise OttError(f'bad regex {pattern!r}: {e}')
+
+
+def _matching_entries(entries: list[dict], pattern: str) -> list[dict]:
+    rx = _compile_tag_pattern(pattern)
+    return [e for e in entries if rx.search(_virtual_path(e))]
+
+
+def cmd_tag_add(pattern: str, tagname: str):
+    store = get_store()
+    entries = store.load_manifest()
+    matched = _matching_entries(entries, pattern)
+    if not matched:
+        print(f'  ✗ no entries match {pattern!r}')
+        return
+    for e in matched:
+        tags = set(e.get('tags') or [])
+        tags.add(tagname)
+        store.update_entry(e['sha256'], {'tags': sorted(tags)})
+    print(f'  + tagged {len(matched)} entr{"y" if len(matched) == 1 else "ies"} with {tagname!r}:')
+    for e in matched:
+        print(f'    {_virtual_path(e)}')
+
+
+def cmd_tag_rm(pattern: str, tagname: str):
+    store = get_store()
+    entries = store.load_manifest()
+    matched = [e for e in _matching_entries(entries, pattern) if tagname in (e.get('tags') or [])]
+    if not matched:
+        print(f'  ✗ no entries match {pattern!r} with tag {tagname!r}')
+        return
+    for e in matched:
+        tags = set(e.get('tags') or [])
+        tags.discard(tagname)
+        store.update_entry(e['sha256'], {'tags': sorted(tags)})
+    print(f'  - removed {tagname!r} from {len(matched)} entr{"y" if len(matched) == 1 else "ies"}:')
+    for e in matched:
+        print(f'    {_virtual_path(e)}')
+
+
+def cmd_tag_list(pattern: str | None = None):
+    store = get_store()
+    entries = store.load_manifest()
+    if pattern:
+        matched = _matching_entries(entries, pattern)
+        if not matched:
+            print(f'  ✗ no entries match {pattern!r}')
+            return
+        for e in matched:
+            tags = e.get('tags') or []
+            print(f'  {_virtual_path(e):<50} {", ".join(sorted(tags)) if tags else "(no tags)"}')
+        return
+
+    counts: dict[str, int] = {}
+    for e in entries:
+        for tag in (e.get('tags') or []):
+            counts[tag] = counts.get(tag, 0) + 1
+    if not counts:
+        print('  No tags yet. Add one with: ott tag add <pattern> <tagname>')
+        return
+    for tag in sorted(counts):
+        n = counts[tag]
+        print(f'  {tag:<24} ({n} entr{"y" if n == 1 else "ies"})')
+
+
+def cmd_tag(subcmd: str, args: list[str]):
+    """Dispatch ott tag <subcmd> <args>."""
+    if subcmd in ('add', 'a'):
+        if len(args) < 2:
+            raise OttError('Usage: tag add <pattern> <tagname>')
+        cmd_tag_add(args[0], args[1])
+    elif subcmd in ('rm', 'remove', 'r'):
+        if len(args) < 2:
+            raise OttError('Usage: tag rm <pattern> <tagname>')
+        cmd_tag_rm(args[0], args[1])
+    elif subcmd in ('list', 'ls', 'l'):
+        cmd_tag_list(args[0] if args else None)
+    else:
+        raise OttError(f'unknown tag subcommand: {subcmd!r}  (add, rm, list)')
 
 
 def cmd_commit():
@@ -1611,31 +1733,57 @@ class OttShell(cmd.Cmd):
         """list  — List all archived files (full flat dump, every path in one table)."""
         _run(cmd_list)
 
-    def do_ls(self, arg):
-        """ls [-a] [dir]  — One-level, unix-style view of the archive hierarchy.
-        Missing entries are hidden unless -a/--all."""
+    def _parse_ls_flags(self, arg: str) -> tuple[list[str], bool, str | None]:
+        """Shared -a/--all and -t/--tag <name> parsing for ls/tree."""
         parts = shlex.split(arg)
         show_all = False
-        while parts and parts[0] in ('-a', '--all'):
-            show_all = True
-            parts.pop(0)
-        _run(cmd_ls, parts[0] if parts else None, show_all)
+        tag = None
+        rest = []
+        i = 0
+        while i < len(parts):
+            if parts[i] in ('-a', '--all'):
+                show_all = True
+            elif parts[i] in ('-t', '--tag') and i + 1 < len(parts):
+                i += 1
+                tag = parts[i]
+            else:
+                rest.append(parts[i])
+            i += 1
+        return rest, show_all, tag
+
+    def do_ls(self, arg):
+        """ls [-a] [-t tag] [dir]  — One-level, unix-style view of the archive
+        hierarchy. Missing entries are hidden unless -a/--all."""
+        parts, show_all, tag = self._parse_ls_flags(arg)
+        _run(cmd_ls, parts[0] if parts else None, show_all, tag)
 
     def complete_ls(self, text, line, begidx, endidx):
         return self._archive_dir_names(text)
 
     def do_tree(self, arg):
-        """tree [-a] [dir]  — Recursive tree view of the archive hierarchy.
-        Missing entries are hidden unless -a/--all."""
-        parts = shlex.split(arg)
-        show_all = False
-        while parts and parts[0] in ('-a', '--all'):
-            show_all = True
-            parts.pop(0)
-        _run(cmd_tree, parts[0] if parts else None, show_all)
+        """tree [-a] [-t tag] [dir]  — Recursive tree view of the archive
+        hierarchy. Missing entries are hidden unless -a/--all."""
+        parts, show_all, tag = self._parse_ls_flags(arg)
+        _run(cmd_tree, parts[0] if parts else None, show_all, tag)
 
     def complete_tree(self, text, line, begidx, endidx):
         return self._archive_dir_names(text)
+
+    def do_tag(self, arg):
+        """tag <add|rm|list> <pattern> <tagname>  — Bulk-tag entries by regex
+        match against their archive path. `tag list` alone shows all known
+        tags with counts."""
+        parts = shlex.split(arg)
+        if not parts:
+            print('  Usage: tag <add|rm|list> [pattern] [tagname]')
+            return
+        _run(cmd_tag, parts[0], parts[1:])
+
+    def complete_tag(self, text, line, begidx, endidx):
+        parts = shlex.split(line[:begidx])
+        if len(parts) == 1:
+            return [s for s in ('add', 'rm', 'list') if s.startswith(text)]
+        return []
 
     def _archive_dir_names(self, text: str) -> list[str]:
         """Top-level virtual directory names, for tab-completing ls/tree args."""
@@ -1875,11 +2023,17 @@ def main():
     p_ls.add_argument('dir', nargs='?', default=None)
     p_ls.add_argument('-a', '--all', action='store_true',
                       help='Show entries missing at last_path too (hidden by default)')
+    p_ls.add_argument('-t', '--tag', default=None, help='Only show entries carrying this tag')
 
     p_tree = sub.add_parser('tree', help='Recursive tree view of the archive hierarchy')
     p_tree.add_argument('dir', nargs='?', default=None)
     p_tree.add_argument('-a', '--all', action='store_true',
                         help='Show entries missing at last_path too (hidden by default)')
+    p_tree.add_argument('-t', '--tag', default=None, help='Only show entries carrying this tag')
+
+    p_tag = sub.add_parser('tag', help='Bulk-tag entries by regex match against their archive path')
+    p_tag.add_argument('subcmd', choices=['add', 'rm', 'list'], metavar='add|rm|list')
+    p_tag.add_argument('args', nargs='*')
 
     sub.add_parser('commit', help='Commit Merkle root to btcvm ledger')
     sub.add_parser('shell',  help='Start interactive shell')
@@ -1931,9 +2085,11 @@ def main():
         elif args.cmd == 'list':
             cmd_list()
         elif args.cmd == 'ls':
-            cmd_ls(args.dir, args.all)
+            cmd_ls(args.dir, args.all, args.tag)
         elif args.cmd == 'tree':
-            cmd_tree(args.dir, args.all)
+            cmd_tree(args.dir, args.all, args.tag)
+        elif args.cmd == 'tag':
+            cmd_tag(args.subcmd, args.args)
         elif args.cmd == 'commit':
             cmd_commit()
         elif args.cmd == 'verify':
