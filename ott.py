@@ -1929,16 +1929,8 @@ class OttShell(cmd.Cmd):
         return rest, depth
 
     def do_ls(self, arg):
-        """ls [-a] [-t tag] [-b] [dir]  — One-level, unix-style view of the
-        archive hierarchy, relative to the current archive dir (see cd).
-        Missing entries are hidden unless -a/--all. Sizes are human-readable
-        unless -b/--bytes."""
-        parts, show_all, tag, human = self._parse_ls_flags(arg)
-        target = self._resolve_archive_path(parts[0] if parts else '')
-        _run(cmd_ls, target, show_all, tag, human)
-
-    def complete_ls(self, text, line, begidx, endidx):
-        return self._archive_dir_names(text)
+        """ls [-b]  — alias for list (full flat dump, every path in one table)."""
+        self.do_list(arg)
 
     def do_tree(self, arg):
         """tree [-a] [-t tag] [-dN] [-b] [dir]  — Recursive tree view of the
@@ -2203,9 +2195,17 @@ class OttShell(cmd.Cmd):
         """h   — help"""
         self.do_help(a)
 
-    def do_l(self, a):
-        """l   — list"""
-        self.do_list(a)
+    def do_l(self, arg):
+        """l [-a] [-t tag] [-b] [dir]  — One-level, unix-style view of the
+        archive hierarchy, relative to the current archive dir (see cd).
+        Missing entries are hidden unless -a/--all. Sizes are human-readable
+        unless -b/--bytes."""
+        parts, show_all, tag, human = self._parse_ls_flags(arg)
+        target = self._resolve_archive_path(parts[0] if parts else '')
+        _run(cmd_ls, target, show_all, tag, human)
+
+    def complete_l(self, text, line, begidx, endidx):
+        return self._archive_dir_names(text)
 
     def do_lls(self, a):
         """lls [path]  — local list (list directory contents on disk)"""
