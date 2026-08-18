@@ -30,6 +30,7 @@ Commands:
     ott verify photo.jpg             Merkle inclusion proof
     ott verify-chunk video.mp4 3     byte-range inclusion proof (video)
     ott find photo.jpg               locate file if it moved; update record
+    ott reindex [root]               relocate all stale entries + re-anchor orig_path
     ott mv photo.jpg /new/path.jpg   update path record
     ott restore photo.jpg /tmp/      copy an archived file's bytes back out
     ott backfill                     store copies for entries added before object storage
@@ -450,7 +451,12 @@ def cmd_add(paths: list[str], recursive: bool = False):
         entry = {
             'sha256':     digest,
             'name':       os.path.basename(path),
-            'orig_path':  os.path.relpath(abs_path, os.getcwd()),
+            # Anchored to the archive root, not os.getcwd() — otherwise adding
+            # the same logical folder from two different working directories
+            # (e.g. once from inside the media folder, once from a project
+            # dir) produces two totally different, cwd-dependent hierarchy
+            # paths for conceptually-related content.
+            'orig_path':  os.path.relpath(abs_path, store.root_dir),
             'last_path':  abs_path,
             'size':       size,
             'added':      time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
@@ -1016,6 +1022,32 @@ def cmd_verify_chunk(path_or_name: str, chunk_idx: int):
             print('  On-chain:     ⚠️  root not yet committed')
 
 
+def _build_fs_index(root: str) -> dict[str, list[str]]:
+    """Single-pass index of basename -> full paths (files and dirs) under
+    root. Used by find/reindex so a bulk operation walks the filesystem once
+    instead of once per entry."""
+    index: dict[str, list[str]] = {}
+    for dirpath, dirs, files in os.walk(root):
+        for name in dirs:
+            index.setdefault(name, []).append(os.path.join(dirpath, name))
+        for name in files:
+            index.setdefault(name, []).append(os.path.join(dirpath, name))
+    return index
+
+
+def _verify_candidate(entry: dict, candidate: str, store: 'OttStore') -> bool:
+    try:
+        if entry.get('type') == 'repo':
+            return os.path.isdir(os.path.join(candidate, '.git'))
+        elif entry.get('type') == 'video':
+            chunks = chunk_hashes(candidate, entry.get('chunk_size', store.chunk_size))
+            return merkle_root(chunks) == entry['sha256']
+        else:
+            return sha256_file(candidate) == entry['sha256']
+    except OSError:
+        return False
+
+
 def cmd_find(name_or_hash: str, search_root: str | None = None):
     """Search filesystem for a file by name or hash prefix; update last_path."""
     store = get_store()
@@ -1033,30 +1065,8 @@ def cmd_find(name_or_hash: str, search_root: str | None = None):
     name = entry['name']
     print(f'  Searching for {name} under {root}…')
 
-    found = []
-    is_repo = entry.get('type') == 'repo'
-    for dirpath, dirs, files in os.walk(root):
-        candidates = []
-        if is_repo:
-            # repos are directories — check subdirs named `name`
-            if name in dirs:
-                candidates.append(os.path.join(dirpath, name))
-        else:
-            if name in files:
-                candidates.append(os.path.join(dirpath, name))
-        for candidate in candidates:
-            try:
-                if is_repo:
-                    match = os.path.isdir(os.path.join(candidate, '.git'))
-                elif entry.get('type') == 'video':
-                    chunks = chunk_hashes(candidate, entry.get('chunk_size', store.chunk_size))
-                    match = merkle_root(chunks) == entry['sha256']
-                else:
-                    match = sha256_file(candidate) == entry['sha256']
-                if match:
-                    found.append(candidate)
-            except OSError:
-                pass
+    index = _build_fs_index(root)
+    found = [c for c in index.get(name, []) if _verify_candidate(entry, c, store)]
 
     if not found:
         print(f'  ✗ Not found under {root}  (name matches but hash differs, or absent)')
@@ -1068,6 +1078,54 @@ def cmd_find(name_or_hash: str, search_root: str | None = None):
     if len(found) > 1:
         print(f'     Also at: {", ".join(found[1:])}')
     print('  Updated last_path in manifest')
+
+
+def cmd_reindex(search_root: str | None = None):
+    """For every non-repo entry: verify last_path is still current, searching
+    the filesystem for it if not (one indexed pass, not one walk per entry),
+    then recompute orig_path anchored to the archive root instead of
+    whatever directory `add` happened to be run from. Fixes messy/duplicate-
+    looking hierarchy paths left over from adds run in different cwds.
+    """
+    store = get_store()
+    entries = store.load_manifest()
+    root = search_root or store.root_dir
+
+    index = None
+    relocated = repathed = still_missing = 0
+
+    for e in entries:
+        if e.get('type') == 'repo':
+            continue
+
+        current_path = e.get('last_path', '')
+        valid = os.path.isfile(current_path) and _verify_candidate(e, current_path, store)
+
+        if not valid:
+            if index is None:
+                print(f'  Scanning {root}…')
+                index = _build_fs_index(root)
+            match = next((c for c in index.get(e['name'], [])
+                         if _verify_candidate(e, c, store)), None)
+            if match is None:
+                still_missing += 1
+                continue
+            if match != current_path:
+                store.update_entry(e['sha256'], {'last_path': match})
+                print(f'  ✅ relocated {e["name"]} → {match}')
+                relocated += 1
+            current_path = match
+
+        new_orig = os.path.relpath(current_path, store.root_dir)
+        if new_orig != e.get('orig_path'):
+            print(f'  {e.get("orig_path")}\n    → {new_orig}')
+            store.update_entry(e['sha256'], {'orig_path': new_orig})
+            repathed += 1
+
+    print(f'\n  Relocated {relocated}, re-pathed {repathed}, still missing {still_missing}')
+    if still_missing:
+        print(f'  ({still_missing} entr{"y" if still_missing == 1 else "ies"} not found under '
+              f'{root} — try `ott reindex <other_root>`)')
 
 
 def cmd_migrate(path: str | None = None):
@@ -1829,6 +1887,13 @@ class OttShell(cmd.Cmd):
             return
         _run(cmd_find, parts[0], parts[1] if len(parts) > 1 else None)
 
+    def do_reindex(self, arg):
+        """reindex [search_root]  — Relocate every stale entry (one indexed scan)
+        and recompute orig_path anchored to the archive root, fixing messy
+        hierarchy paths left over from `add` being run from different cwds."""
+        parts = shlex.split(arg)
+        _run(cmd_reindex, parts[0] if parts else None)
+
     def do_repo(self, arg):
         """repo <add|list|verify|update|tag|verify-tag|qr> [args]  — Archive git repos."""
         parts = shlex.split(arg)
@@ -2049,6 +2114,10 @@ def main():
     p_find.add_argument('name')
     p_find.add_argument('search_root', nargs='?', default=None)
 
+    p_reindex = sub.add_parser('reindex', help='Relocate stale entries and re-anchor orig_path '
+                                               'to the archive root')
+    p_reindex.add_argument('search_root', nargs='?', default=None)
+
     p_mv = sub.add_parser('mv', help='Update path record for a file')
     p_mv.add_argument('name')
     p_mv.add_argument('new_path')
@@ -2098,6 +2167,8 @@ def main():
             cmd_verify_chunk(args.path, args.chunk)
         elif args.cmd == 'find':
             cmd_find(args.name, args.search_root)
+        elif args.cmd == 'reindex':
+            cmd_reindex(args.search_root)
         elif args.cmd == 'mv':
             cmd_mv(args.name, args.new_path)
         elif args.cmd == 'restore':
