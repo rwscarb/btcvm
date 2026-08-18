@@ -608,11 +608,21 @@ def cmd_find(name_or_hash: str, search_root: str | None = None):
     print(f'  Searching for {name} under {root}…')
 
     found = []
-    for dirpath, _dirs, files in os.walk(root):
-        if name in files:
-            candidate = os.path.join(dirpath, name)
+    is_repo = entry.get('type') == 'repo'
+    for dirpath, dirs, files in os.walk(root):
+        candidates = []
+        if is_repo:
+            # repos are directories — check subdirs named `name`
+            if name in dirs:
+                candidates.append(os.path.join(dirpath, name))
+        else:
+            if name in files:
+                candidates.append(os.path.join(dirpath, name))
+        for candidate in candidates:
             try:
-                if entry.get('type') == 'video':
+                if is_repo:
+                    match = os.path.isdir(os.path.join(candidate, '.git'))
+                elif entry.get('type') == 'video':
                     chunks = chunk_hashes(candidate, entry.get('chunk_size', store.chunk_size))
                     match = merkle_root(chunks) == entry['sha256']
                 else:
@@ -1313,6 +1323,44 @@ class OttShell(cmd.Cmd):
                 print(f'  ✗ not a file or valid hex hash: {path}')
                 return
             cmd_qr(sha256_file(path), label=os.path.basename(path))
+
+    def do_pwd(self, _arg):
+        """pwd  — Print current working directory."""
+        print(f'  {os.getcwd()}')
+
+    def do_cd(self, arg):
+        """cd <path>  — Change working directory."""
+        path = os.path.expanduser(shlex.split(arg)[0]) if arg.strip() else os.path.expanduser('~')
+        try:
+            os.chdir(path)
+            print(f'  {os.getcwd()}')
+        except OSError as e:
+            print(f'  ✗ {e}')
+
+    def do_ls_dir(self, arg):
+        """lsd [path]  — List directory contents."""
+        path = os.path.expanduser(shlex.split(arg)[0]) if arg.strip() else '.'
+        try:
+            entries = sorted(os.listdir(path))
+            for name in entries:
+                full = os.path.join(path, name)
+                suffix = '/' if os.path.isdir(full) else ''
+                print(f'  {name}{suffix}')
+        except OSError as e:
+            print(f'  ✗ {e}')
+
+    def default(self, line):
+        """Pass through !cmd to shell."""
+        if line.startswith('!'):
+            import subprocess
+            cmd_str = line[1:].strip()
+            if cmd_str:
+                result = subprocess.run(cmd_str, shell=True, text=True,
+                                        capture_output=False)
+            else:
+                print('  Usage: !<shell command>')
+        else:
+            print(f'  *** Unknown syntax: {line}')
 
     def do_quit(self, _arg):
         """quit  — Exit ott shell."""
