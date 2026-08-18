@@ -2,13 +2,17 @@
 ott.py — Bitcoin-anchored media archive for btcvm.
 
 Metadata lives in .ott/ (like .git) — archive travels with your files,
-works from any subdirectory, and survives file moves gracefully.
+works from any subdirectory, and survives file moves gracefully. If no
+project .ott/ is found walking up from cwd, commands fall back to a
+global archive at ~/.ott (override with OTT_HOME) so there's always
+somewhere to write — `ott init` is optional, not required.
 
     .ott/
       config          # JSON: chunk_size, created, version
       manifest.jsonl  # per-file records; last-write-wins on sha256
       ledger.jsonl    # Bitcoin commitments
       chunks/         # <file_root_hash>.json — chunk lists (video only)
+      objects/        # <hash[:2]>/<hash> — content-addressed copies (hardlinked when possible)
 
 Commands:
     ott init                         create .ott/ in current directory
@@ -22,6 +26,8 @@ Commands:
     ott verify-chunk video.mp4 3     byte-range inclusion proof (video)
     ott find photo.jpg               locate file if it moved; update record
     ott mv photo.jpg /new/path.jpg   update path record
+    ott restore photo.jpg /tmp/      copy an archived file's bytes back out
+    ott backfill                     store copies for entries added before object storage
     ott qr                           QR code of current Merkle root
     ott                              interactive shell (all commands + aliases)
 """
@@ -142,6 +148,11 @@ def find_ott_dir(start: str | None = None) -> str | None:
         cur = parent
 
 
+def default_ott_home() -> str:
+    """Fallback archive location when no project .ott/ is found walking up from cwd."""
+    return os.environ.get('OTT_HOME', os.path.expanduser('~/.ott'))
+
+
 class OttStore:
     def __init__(self, ott_dir: str):
         self.dir           = ott_dir
@@ -150,21 +161,52 @@ class OttStore:
         self.ledger_path   = os.path.join(ott_dir, 'ledger.jsonl')
         self.config_path   = os.path.join(ott_dir, 'config')
         self.chunks_dir    = os.path.join(ott_dir, 'chunks')
+        self.objects_dir   = os.path.join(ott_dir, 'objects')
+
+    @staticmethod
+    def _create(ott_dir: str) -> 'OttStore':
+        os.makedirs(os.path.join(ott_dir, 'chunks'), exist_ok=True)
+        os.makedirs(os.path.join(ott_dir, 'objects'), exist_ok=True)
+        cfg_path = os.path.join(ott_dir, 'config')
+        if not os.path.exists(cfg_path):
+            cfg = {
+                'version':    1,
+                'created':    time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                'chunk_size': CHUNK_SIZE_DEFAULT,
+            }
+            with open(cfg_path, 'w') as f:
+                json.dump(cfg, f, indent=2)
+        return OttStore(ott_dir)
 
     @classmethod
     def init(cls, path: str = '.') -> 'OttStore':
         ott_dir = os.path.join(os.path.abspath(path), '.ott')
         if os.path.exists(ott_dir):
             raise OttError(f'.ott/ already exists at {ott_dir}')
-        os.makedirs(os.path.join(ott_dir, 'chunks'))
-        cfg = {
-            'version':    1,
-            'created':    time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-            'chunk_size': CHUNK_SIZE_DEFAULT,
-        }
-        with open(os.path.join(ott_dir, 'config'), 'w') as f:
-            json.dump(cfg, f, indent=2)
-        return cls(ott_dir)
+        return cls._create(ott_dir)
+
+    def object_path(self, sha256: str) -> str:
+        return os.path.join(self.objects_dir, sha256[:2], sha256)
+
+    def has_object(self, sha256: str) -> bool:
+        return os.path.isfile(self.object_path(sha256))
+
+    def put_object(self, sha256: str, src_path: str) -> str:
+        """Store a content-addressed copy of src_path. Hard-links when the
+        archive and source share a filesystem (free); falls back to a full
+        byte copy across filesystem boundaries (EXDEV) or where hard links
+        aren't supported.
+        """
+        dest = self.object_path(sha256)
+        if os.path.isfile(dest):
+            return dest
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        try:
+            os.link(src_path, dest)
+        except OSError:
+            import shutil
+            shutil.copy2(src_path, dest)
+        return dest
 
     def config(self) -> dict:
         if not os.path.exists(self.config_path):
@@ -261,10 +303,13 @@ def get_store() -> OttStore:
         return _store
     ott_dir = find_ott_dir()
     if ott_dir is None:
-        raise OttNotFoundError(
-            'No .ott/ archive found in this directory tree.\n'
-            '  Run: ott init'
-        )
+        # No project archive in this tree — fall back to a global one so
+        # commands work from anywhere without an explicit `ott init`.
+        ott_dir = default_ott_home()
+        is_new = not os.path.isdir(ott_dir)
+        OttStore._create(ott_dir)
+        if is_new:
+            print(f'  ℹ️  No project .ott/ found — using global archive at {ott_dir}')
     _store = OttStore(ott_dir)
     return _store
 
@@ -410,6 +455,10 @@ def cmd_add(paths: list[str], recursive: bool = False):
         store.save_entry(entry)
         if video and chunks:
             store.save_chunks(digest, chunks)
+        try:
+            store.put_object(digest, path)
+        except OSError as e:
+            print(f'  ⚠️  Could not store an archive copy of {os.path.basename(path)}: {e}')
         existing.add(digest)
         added += 1
         tag = f'  [{n_chunks} chunks × {chunk_size // 1024}KB]' if video else ''
@@ -466,13 +515,15 @@ def cmd_list():
         is_repo = etype == 'repo'
         path_ok = (os.path.isdir if is_repo else os.path.isfile)(e.get('last_path', ''))
         ok = '✅' if path_ok else '⚠️ '
+        backed = '📦' if (not is_repo and store.has_object(e['sha256'])) else '  '
         display = e.get('orig_path') or e['name']
         if len(display) > 44:
             display = '…' + display[-43:]
         print(f'  {i:<4} {t:<2} {display:<44} {e["sha256"][:16]}…  '
-              f'{e.get("size", 0):>10,}  {ok}')
+              f'{e.get("size", 0):>10,}  {ok}{backed}')
     print(f'\n  Merkle root: {store.current_root()}')
-    print('  T: I=image V=video R=repo  ✅=at last_path  ⚠️ =path missing (run ott find)')
+    print('  T: I=image V=video R=repo  ✅=at last_path  ⚠️ =path missing (run ott find)  '
+          '📦=archive copy stored (run ott backfill)')
 
 
 def cmd_commit():
@@ -559,7 +610,13 @@ def cmd_verify(path_or_name: str):
     name = os.path.basename(path_or_name)
 
     if os.path.isfile(abs_path):
-        digest = sha256_file(abs_path)
+        if is_video(abs_path):
+            candidate, _ = _resolve_entry(entries, path_or_name)
+            chunk_size = (candidate.get('chunk_size') if candidate else None) or store.chunk_size
+            chunks = chunk_hashes(abs_path, chunk_size)
+            digest = merkle_root(chunks) if chunks else hashlib.sha256(b'').hexdigest()
+        else:
+            digest = sha256_file(abs_path)
         source = 'live file'
     else:
         entry, err = _resolve_entry(entries, path_or_name)
@@ -570,9 +627,13 @@ def cmd_verify(path_or_name: str):
             print(f'  ✗ {name} not in archive and not found on disk')
             return
         digest = entry['sha256']
-        source = f'manifest only (file not found at {entry.get("last_path", "?")})'
-        print('  ⚠️  File not at last known path — proof uses stored hash')
-        print(f'     Run `ott find {name}` to locate it and update the record')
+        obj_path = store.object_path(digest)
+        if os.path.isfile(obj_path):
+            source = f'archived copy at {obj_path}'
+        else:
+            source = f'manifest only (file not found at {entry.get("last_path", "?")})'
+            print('  ⚠️  File not at last known path, and no archived copy — proof uses stored hash only')
+            print(f'     Run `ott find {name}` to locate it and update the record')
 
     if digest not in leaves:
         print(f'  ✗ {name} not in archive  (SHA256: {digest})')
@@ -751,6 +812,61 @@ def cmd_mv(name_or_hash: str, new_path: str):
 
     store.update_entry(entry['sha256'], updates)
     print(f'  ✅ {entry["name"]} → {abs_new}')
+
+
+def cmd_restore(name_or_hash: str, dest: str):
+    """Copy an archived file's content back out to dest, from the local object store."""
+    store = get_store()
+    entries = store.load_manifest()
+
+    entry, err = _resolve_entry(entries, name_or_hash)
+    if err:
+        print(err)
+        return
+    if entry is None:
+        print(f'  ✗ {name_or_hash} not in archive')
+        return
+
+    obj_path = store.object_path(entry['sha256'])
+    if not os.path.isfile(obj_path):
+        print(f'  ✗ No archived copy of {entry["name"]} — only the hash was recorded '
+              f'(added before object storage, or the source was on another filesystem)')
+        return
+
+    dest_abs = os.path.abspath(dest)
+    if os.path.isdir(dest_abs):
+        dest_abs = os.path.join(dest_abs, entry['name'])
+    os.makedirs(os.path.dirname(dest_abs) or '.', exist_ok=True)
+    if os.path.exists(dest_abs):
+        print(f'  ✗ {dest_abs} already exists — not overwriting')
+        return
+
+    import shutil
+    shutil.copy2(obj_path, dest_abs)
+    print(f'  ✅ Restored {entry["name"]} → {dest_abs}')
+
+
+def cmd_backfill():
+    """Store archive copies for entries that are on disk but not yet object-stored."""
+    store = get_store()
+    entries = store.load_manifest()
+    done = had = missing = 0
+
+    for e in entries:
+        if e.get('type') == 'repo':
+            continue
+        if store.has_object(e['sha256']):
+            had += 1
+            continue
+        last_path = e.get('last_path', '')
+        if not os.path.isfile(last_path):
+            missing += 1
+            continue
+        store.put_object(e['sha256'], last_path)
+        done += 1
+        print(f'  + stored copy of {e["name"]}')
+
+    print(f'\n  Backfilled {done}  |  already stored {had}  |  not found on disk {missing}')
 
 
 # ── Git / repo ───────────────────────────────────────────────────────────────
@@ -1398,6 +1514,24 @@ class OttShell(cmd.Cmd):
             return
         _run(cmd_mv, parts[0], parts[1])
 
+    def do_restore(self, arg):
+        """restore <name_or_hash> <dest>  — Copy an archived file's content back out to dest."""
+        parts = shlex.split(arg)
+        if len(parts) < 2:
+            print('  Usage: restore <name_or_hash> <dest>')
+            return
+        _run(cmd_restore, parts[0], os.path.expanduser(parts[1]))
+
+    def complete_restore(self, text, line, begidx, endidx):
+        parts = shlex.split(line[:begidx])
+        if len(parts) == 1:
+            return self._manifest_names(text)
+        return self._files(text)
+
+    def do_backfill(self, _arg):
+        """backfill  — Store archive copies for entries on disk but not yet object-stored."""
+        _run(cmd_backfill)
+
     def do_qr(self, arg):
         """qr [hash|file]  — QR code for a hash, file SHA256, or current Merkle root."""
         parts = shlex.split(arg)
@@ -1554,6 +1688,12 @@ def main():
     p_mv.add_argument('name')
     p_mv.add_argument('new_path')
 
+    p_restore = sub.add_parser('restore', help="Copy an archived file's content back out to dest")
+    p_restore.add_argument('name')
+    p_restore.add_argument('dest')
+
+    sub.add_parser('backfill', help='Store archive copies for entries found on disk but not yet stored')
+
     p_qr = sub.add_parser('qr', help='QR code for a hash, file, or current root')
     p_qr.add_argument('target', nargs='?')
 
@@ -1589,6 +1729,10 @@ def main():
             cmd_find(args.name, args.search_root)
         elif args.cmd == 'mv':
             cmd_mv(args.name, args.new_path)
+        elif args.cmd == 'restore':
+            cmd_restore(args.name, args.dest)
+        elif args.cmd == 'backfill':
+            cmd_backfill()
         elif args.cmd == 'qr':
             t = args.target
             if not t:
