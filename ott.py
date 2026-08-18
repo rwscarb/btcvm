@@ -617,6 +617,14 @@ def _is_missing(e: dict) -> bool:
     return not os.path.isfile(e.get('last_path', ''))
 
 
+def _has_bad_path(e: dict) -> bool:
+    """True if orig_path contains a literal '..' segment — leftover from
+    before orig_path was anchored to the archive root instead of whatever
+    cwd `add` happened to run from. `ott reindex` fixes these at the
+    source; until then they're just noise in the hierarchy views."""
+    return '..' in _virtual_path(e).split('/')
+
+
 def _group_children(entries: list[dict], prefix: str,
                     predicate=None) -> tuple[dict[str, list], list[dict]]:
     """Split entries into (dirs, files) directly under prefix ('' = archive root).
@@ -648,14 +656,15 @@ def _group_children(entries: list[dict], prefix: str,
 
 
 def _visibility_predicate(show_all: bool, tag: str | None):
-    """Build the (entry) -> bool filter shared by ls/tree: hides missing entries
-    unless show_all, and restricts to entries carrying `tag` when given.
-    Returns None when nothing needs filtering (show_all and no tag)."""
+    """Build the (entry) -> bool filter shared by ls/tree: hides missing and
+    malformed-path (literal '..' segment) entries unless show_all, and
+    restricts to entries carrying `tag` when given. Returns None when
+    nothing needs filtering (show_all and no tag)."""
     if show_all and not tag:
         return None
 
     def pred(e: dict) -> bool:
-        if not show_all and _is_missing(e):
+        if not show_all and (_is_missing(e) or _has_bad_path(e)):
             return False
         if tag and tag not in (e.get('tags') or []):
             return False
@@ -720,8 +729,8 @@ def cmd_ls(path_filter: str | None = None, show_all: bool = False, tag: str | No
         hidden = (len(d2) - len(d1)) + (len(f2) - len(f1))
         if hidden:
             flag = f'-a --tag {tag}' if tag else '-a'
-            print(f'\n  ({hidden} missing item{"s" if hidden != 1 else ""} hidden — '
-                  f'use `ott ls {flag}{" " + prefix if prefix else ""}` to show)')
+            print(f'\n  ({hidden} missing/malformed-path item{"s" if hidden != 1 else ""} hidden — '
+                  f'use `ott ls {flag}{" " + prefix if prefix else ""}` to show, or `ott reindex` to fix)')
 
     child = f'{prefix}/<name>' if prefix else '<name>'
     print(f'\n  Drill in with: ott ls {child}   or see everything at once with: ott list')
@@ -802,8 +811,9 @@ def cmd_tree(path_filter: str | None = None, show_all: bool = False, tag: str | 
     hidden_note = ''
     if not show_all and counts['hidden']:
         flag = f'-a --tag {tag}' if tag else '-a'
-        hidden_note = (f"  ({counts['hidden']} missing item"
-                        f"{'s' if counts['hidden'] != 1 else ''} hidden — use `ott tree {flag}` to show)")
+        hidden_note = (f"  ({counts['hidden']} missing/malformed-path item"
+                        f"{'s' if counts['hidden'] != 1 else ''} hidden — "
+                        f"use `ott tree {flag}` to show, or `ott reindex` to fix)")
     depth_note = f'  (depth {max_depth} — use `ott tree -d0` for unlimited)' if truncated[0] else ''
     print(f"\n  {counts['dirs']} director{'y' if counts['dirs'] == 1 else 'ies'}, "
           f"{counts['files']} file{'s' if counts['files'] != 1 else ''}{hidden_note}{depth_note}")
