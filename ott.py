@@ -1236,10 +1236,20 @@ class OttShell(cmd.Cmd):
 
     def do_add(self, arg):
         """add <file> [file ...]  — Add images or video to the archive."""
-        paths = shlex.split(arg)
-        if not paths:
+        import glob
+        tokens = shlex.split(arg)
+        if not tokens:
             print('  Usage: add <file> [file ...]')
             return
+        # Expand globs and ~ for each token
+        paths = []
+        for token in tokens:
+            expanded = os.path.expanduser(token)
+            matches = glob.glob(expanded)
+            if matches:
+                paths.extend(sorted(matches))
+            else:
+                paths.append(expanded)  # let cmd_add report the missing file
         _run(cmd_add, paths)
 
     def do_status(self, _arg):
