@@ -1670,6 +1670,10 @@ class OttShell(cmd.Cmd):
     )
     prompt = 'ott> '
 
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.archive_cwd = ''  # current dir *within the archive hierarchy*, '' = root
+
     def preloop(self):
         try:
             import readline
@@ -1811,21 +1815,74 @@ class OttShell(cmd.Cmd):
 
     def do_ls(self, arg):
         """ls [-a] [-t tag] [dir]  — One-level, unix-style view of the archive
-        hierarchy. Missing entries are hidden unless -a/--all."""
+        hierarchy, relative to the current archive dir (see cd). Missing
+        entries are hidden unless -a/--all."""
         parts, show_all, tag = self._parse_ls_flags(arg)
-        _run(cmd_ls, parts[0] if parts else None, show_all, tag)
+        target = self._resolve_archive_path(parts[0] if parts else '')
+        _run(cmd_ls, target, show_all, tag)
 
     def complete_ls(self, text, line, begidx, endidx):
         return self._archive_dir_names(text)
 
     def do_tree(self, arg):
         """tree [-a] [-t tag] [dir]  — Recursive tree view of the archive
-        hierarchy. Missing entries are hidden unless -a/--all."""
+        hierarchy, relative to the current archive dir (see cd). Missing
+        entries are hidden unless -a/--all."""
         parts, show_all, tag = self._parse_ls_flags(arg)
-        _run(cmd_tree, parts[0] if parts else None, show_all, tag)
+        target = self._resolve_archive_path(parts[0] if parts else '')
+        _run(cmd_tree, target, show_all, tag)
 
     def complete_tree(self, text, line, begidx, endidx):
         return self._archive_dir_names(text)
+
+    def _resolve_archive_path(self, arg: str) -> str:
+        """Resolve a cd/ls/tree path argument against the current archive
+        directory. Leading '/' means from the root; '..' goes up a level;
+        '' (no arg) means the current archive dir; anything else is
+        relative — same rules as a real shell's cd."""
+        if not arg or arg == '.':
+            return self.archive_cwd
+        if arg == '/':
+            return ''
+        parts = arg.split('/')
+        base = [] if arg.startswith('/') else [p for p in self.archive_cwd.split('/') if p]
+        for p in parts:
+            if p in ('', '.'):
+                continue
+            elif p == '..':
+                if base:
+                    base.pop()
+            else:
+                base.append(p)
+        return '/'.join(base)
+
+    def do_cd(self, arg):
+        """cd [dir]  — Change the current *archive* directory (navigates the
+        virtual hierarchy from orig_path, not the real filesystem — see lcd
+        for that). No arg or `cd /` goes to root, `cd ..` goes up a level.
+        Sets the default target for ls/tree."""
+        parts = shlex.split(arg)
+        target = self._resolve_archive_path(parts[0] if parts else '')
+        if target:
+            try:
+                entries = get_store().load_manifest()
+            except OttNotFoundError as e:
+                print(f'  ✗ {e}')
+                return
+            dirs, files = _group_children(entries, target)
+            if not dirs and not files:
+                print(f'  ✗ no such archive directory: /{target}')
+                return
+        self.archive_cwd = target
+        self.prompt = f'ott:/{target}> ' if target else 'ott> '
+
+    def complete_cd(self, text, line, begidx, endidx):
+        return self._archive_dir_names(text)
+
+    def do_pwd(self, _arg):
+        """pwd  — Print the current *archive* directory (see lpwd for the
+        real filesystem one)."""
+        print(f'  /{self.archive_cwd}' if self.archive_cwd else '  /')
 
     def do_tag(self, arg):
         """tag <add|rm|list> <pattern> <tagname>  — Bulk-tag entries by regex
@@ -1844,17 +1901,22 @@ class OttShell(cmd.Cmd):
         return []
 
     def _archive_dir_names(self, text: str) -> list[str]:
-        """Top-level virtual directory names, for tab-completing ls/tree args."""
+        """Tab-complete dir names for cd/ls/tree, relative to the current
+        archive dir. Handles a partial multi-segment path like '82/2'."""
         try:
             entries = get_store().load_manifest()
         except OttNotFoundError:
             return []
-        names = set()
-        for e in entries:
-            parts = [p for p in _virtual_path(e).split('/') if p]
-            if len(parts) > 1:
-                names.add(parts[0])
-        return [n for n in names if n.startswith(text)]
+        if '/' in text:
+            head, _, tail = text.rpartition('/')
+            base = self._resolve_archive_path(head)
+            out_prefix = head + '/'
+        else:
+            base = self.archive_cwd
+            tail = text
+            out_prefix = ''
+        dirs, _ = _group_children(entries, base)
+        return [out_prefix + n + '/' for n in dirs if n.startswith(tail)]
 
     def do_commit(self, _arg):
         """commit  — Commit Merkle root to btcvm ledger."""
@@ -1966,12 +2028,13 @@ class OttShell(cmd.Cmd):
                 return
             cmd_qr(sha256_file(path), label=os.path.basename(path))
 
-    def do_pwd(self, _arg):
-        """pwd  — Print current working directory."""
+    def do_lpwd(self, _arg):
+        """lpwd  — Print the local (real filesystem) working directory."""
         print(f'  {os.getcwd()}')
 
-    def do_cd(self, arg):
-        """cd <path>  — Change working directory."""
+    def do_lcd(self, arg):
+        """lcd <path>  — Change the local (real filesystem) working directory
+        — affects where add/find/lls look, not the archive cd."""
         path = os.path.expanduser(shlex.split(arg)[0]) if arg.strip() else os.path.expanduser('~')
         try:
             os.chdir(path)
