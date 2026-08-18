@@ -794,7 +794,8 @@ def cmd_tree(path_filter: str | None = None, show_all: bool = False, tag: str | 
             cont = '    ' if is_last else '│   '
             if kind == 'D':
                 counts['dirs'] += 1
-                print(f'  {indent}{branch}{chain}{item}/')
+                total_size = sum(x.get('size', 0) for x in d[item])
+                print(f'  {indent}{branch}{chain}{item}/  ({_fmt_size(total_size, human)})')
                 child_prefix = f'{cur_prefix}/{item}' if cur_prefix else item
                 if max_depth and depth >= max_depth:
                     truncated[0] = True
