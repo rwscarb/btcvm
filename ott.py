@@ -697,11 +697,22 @@ def cmd_tree(path_filter: str | None = None, show_all: bool = False, tag: str | 
         print(f'  (filtered to tag: {tag})')
     counts = {'dirs': 0, 'files': 0, 'hidden': 0}
 
-    def _walk(cur_prefix: str, indent: str):
+    def _walk(cur_prefix: str, indent: str, chain: str = ''):
         d, f = _group_children(entries, cur_prefix, pred)
         if not show_all:
             all_d, all_f = _group_children(entries, cur_prefix, _visibility_predicate(True, tag))
             counts['hidden'] += (len(all_d) - len(d)) + (len(all_f) - len(f))
+
+        # Collapse a run of directories that each have exactly one child and
+        # no sibling files — "Desktop/" -> "home movies/" folds into a
+        # single "Desktop/home movies/" line instead of two nested levels
+        # that carry no branching information.
+        if len(d) == 1 and not f:
+            only_name = next(iter(d))
+            child_prefix = f'{cur_prefix}/{only_name}' if cur_prefix else only_name
+            _walk(child_prefix, indent, chain + only_name + '/')
+            return
+
         items = [('D', name) for name in sorted(d)] + \
                 [('F', e) for e in sorted(f, key=lambda e: e['name'])]
         for idx, (kind, item) in enumerate(items):
@@ -710,14 +721,14 @@ def cmd_tree(path_filter: str | None = None, show_all: bool = False, tag: str | 
             cont = '    ' if is_last else '│   '
             if kind == 'D':
                 counts['dirs'] += 1
-                print(f'  {indent}{branch}{item}/')
+                print(f'  {indent}{branch}{chain}{item}/')
                 child_prefix = f'{cur_prefix}/{item}' if cur_prefix else item
                 _walk(child_prefix, indent + cont)
             else:
                 counts['files'] += 1
                 e = item
                 ok, backed = _entry_status_icons(store, e)
-                print(f'  {indent}{branch}{e["name"]}  ({e.get("size", 0):,})  {ok}{backed}')
+                print(f'  {indent}{branch}{chain}{e["name"]}  ({e.get("size", 0):,})  {ok}{backed}')
 
     _walk(prefix, '')
     hidden_note = ''
