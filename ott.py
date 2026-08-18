@@ -177,20 +177,31 @@ class OttStore:
                                   self.config().get('chunk_size', CHUNK_SIZE_DEFAULT)))
 
     def load_manifest(self) -> list[dict]:
-        """Load entries; last write per sha256 wins (append = update)."""
+        """Load entries; last write per sha256 wins (append = update).
+        Repos additionally deduplicate by name — a repo's identity is its
+        name, not its commit hash, so re-adding at a new commit replaces.
+        """
         if not os.path.exists(self.manifest_path):
             return []
-        seen: dict[str, dict] = {}
+        by_hash: dict[str, dict] = {}
+        by_repo_name: dict[str, str] = {}  # repo name → sha256 of latest entry
         with open(self.manifest_path) as f:
             for line in f:
                 line = line.strip()
                 if line:
                     try:
                         e = json.loads(line)
-                        seen[e['sha256']] = e
+                        sha = e['sha256']
+                        by_hash[sha] = e
+                        if e.get('type') == 'repo':
+                            # evict old sha256 for this repo name
+                            old_sha = by_repo_name.get(e['name'])
+                            if old_sha and old_sha != sha:
+                                by_hash.pop(old_sha, None)
+                            by_repo_name[e['name']] = sha
                     except (json.JSONDecodeError, KeyError):
                         pass
-        return list(seen.values())
+        return list(by_hash.values())
 
     def save_entry(self, entry: dict):
         with open(self.manifest_path, 'a') as f:
@@ -1374,6 +1385,10 @@ class OttShell(cmd.Cmd):
         pass
 
     # ── aliases ───────────────────────────────────────────────────────────────
+
+    def do_h(self, a):
+        """h   — help"""
+        self.do_help(a)
 
     def do_l(self, a):
         """l   — list"""
