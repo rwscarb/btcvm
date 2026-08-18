@@ -14,6 +14,7 @@ Commands:
     ott init                         create .ott/ in current directory
     ott init --migrate               init + import old ott_manifest.jsonl
     ott add photo.jpg video.mp4      add files (images or video)
+    ott add -r ./dvds                add a directory tree recursively
     ott status                       current state + Merkle root
     ott list                         list archived files
     ott commit                       commit Merkle root to Bitcoin ledger
@@ -337,11 +338,38 @@ def _do_migrate(store: OttStore, path: str):
         break
 
 
-def cmd_add(paths: list[str]):
+_SKIP_DIRS = {'.ott', '.git'}
+
+
+def _walk_files(root: str) -> list[str]:
+    """Recursively collect regular files under root, skipping .ott/.git."""
+    found = []
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+        for name in sorted(files):
+            found.append(os.path.join(dirpath, name))
+    return found
+
+
+def cmd_add(paths: list[str], recursive: bool = False):
     store = get_store()
     existing = {e['sha256'] for e in store.load_manifest()}
     chunk_size = store.chunk_size
     added = 0
+
+    expanded = []
+    for path in paths:
+        if os.path.isdir(path):
+            if not recursive:
+                print(f'  ✗ {path} is a directory (use -r/--recursive to add its contents)')
+                continue
+            files = _walk_files(path)
+            if not files:
+                print(f'  (no files under {path})')
+            expanded.extend(files)
+        else:
+            expanded.append(path)
+    paths = expanded
 
     for path in paths:
         if not os.path.isfile(path):
@@ -1273,11 +1301,15 @@ class OttShell(cmd.Cmd):
         _run(cmd_init, path, migrate)
 
     def do_add(self, arg):
-        """add <file> [file ...]  — Add images or video to the archive."""
+        """add [-r] <file> [file ...]  — Add images or video (dirs need -r/--recursive)."""
         import glob
         tokens = shlex.split(arg)
+        recursive = False
+        while tokens and tokens[0] in ('-r', '--recursive'):
+            recursive = True
+            tokens.pop(0)
         if not tokens:
-            print('  Usage: add <file> [file ...]')
+            print('  Usage: add [-r] <file> [file ...]')
             return
         # Expand globs and ~ for each token
         paths = []
@@ -1288,7 +1320,7 @@ class OttShell(cmd.Cmd):
                 paths.extend(sorted(matches))
             else:
                 paths.append(expanded)  # let cmd_add report the missing file
-        _run(cmd_add, paths)
+        _run(cmd_add, paths, recursive)
 
     def do_status(self, _arg):
         """status  — Show archive status and current Merkle root."""
@@ -1499,6 +1531,8 @@ def main():
 
     p_add = sub.add_parser('add', help='Add images or video to the archive')
     p_add.add_argument('paths', nargs='+')
+    p_add.add_argument('-r', '--recursive', action='store_true',
+                        help='Recurse into directories (skips .ott/.git)')
 
     sub.add_parser('status', help='Show archive status and Merkle root')
     sub.add_parser('list',   help='List all archived files')
@@ -1540,7 +1574,7 @@ def main():
         elif args.cmd == 'init':
             cmd_init(args.path, args.migrate)
         elif args.cmd == 'add':
-            cmd_add(args.paths)
+            cmd_add(args.paths, args.recursive)
         elif args.cmd == 'status':
             cmd_status()
         elif args.cmd == 'list':
