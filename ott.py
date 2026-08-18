@@ -546,10 +546,19 @@ def _entry_status_icons(store: 'OttStore', e: dict) -> tuple[str, str]:
     return ok, backed
 
 
-def _group_children(entries: list[dict], prefix: str) -> tuple[dict[str, list], list[dict]]:
+def _is_missing(e: dict) -> bool:
+    if e.get('type') == 'repo':
+        return not os.path.isdir(e.get('last_path', ''))
+    return not os.path.isfile(e.get('last_path', ''))
+
+
+def _group_children(entries: list[dict], prefix: str,
+                    show_missing: bool = True) -> tuple[dict[str, list], list[dict]]:
     """Split entries into (dirs, files) directly under prefix ('' = archive root).
     dirs: {dirname: [entries under it, at any depth]}
     files: [entries whose virtual path sits directly at this level]
+    When show_missing is False, missing files are dropped and directories left
+    with no visible entries afterward are dropped entirely.
     """
     prefix_parts = [p for p in prefix.split('/') if p] if prefix else []
     dirs: dict[str, list] = {}
@@ -562,14 +571,19 @@ def _group_children(entries: list[dict], prefix: str) -> tuple[dict[str, list], 
         if not rest:
             continue
         if len(rest) == 1:
-            files.append(e)
+            if show_missing or not _is_missing(e):
+                files.append(e)
         else:
             dirs.setdefault(rest[0], []).append(e)
+    if not show_missing:
+        dirs = {name: [x for x in sub if not _is_missing(x)] for name, sub in dirs.items()}
+        dirs = {name: sub for name, sub in dirs.items() if sub}
     return dirs, files
 
 
-def cmd_ls(path_filter: str | None = None):
+def cmd_ls(path_filter: str | None = None, show_all: bool = False):
     """One-level, unix-`ls`-style view of the archive hierarchy (orig_path-based).
+    Entries whose file/repo is missing at last_path are hidden unless show_all.
     Use `ott list`/`l` for the full flat dump with every path in one table.
     """
     store = get_store()
@@ -579,8 +593,14 @@ def cmd_ls(path_filter: str | None = None):
         return
 
     prefix = (path_filter or '').strip('/')
-    dirs, files = _group_children(entries, prefix)
+    dirs, files = _group_children(entries, prefix, show_missing=show_all)
     if not dirs and not files:
+        if not show_all:
+            all_dirs, all_files = _group_children(entries, prefix, show_missing=True)
+            if all_dirs or all_files:
+                print(f'  Nothing present under /{prefix} — everything here is missing '
+                      f'at last_path. Run `ott ls -a{" " + prefix if prefix else ""}` to see it.')
+                return
         print(f'  ✗ nothing found under /{prefix}' if prefix else '  Archive is empty.')
         return
 
@@ -590,8 +610,7 @@ def cmd_ls(path_filter: str | None = None):
     for name in sorted(dirs):
         sub = dirs[name]
         total_size = sum(e.get('size', 0) for e in sub)
-        n_missing = sum(1 for e in sub
-                        if e.get('type') != 'repo' and not os.path.isfile(e.get('last_path', '')))
+        n_missing = sum(1 for e in sub if _is_missing(e))
         ok = '✅ ' if n_missing == 0 else '❌ '
         n = len(sub)
         print(f'  {"D":<2} {name + "/":<44} {total_size:>14,}  {ok} ·   '
@@ -604,12 +623,22 @@ def cmd_ls(path_filter: str | None = None):
         if len(display) > 44:
             display = '…' + display[-43:]
         print(f'  {t:<2} {display:<44} {e.get("size", 0):>14,}  {ok} {backed}')
+
+    if not show_all:
+        all_dirs, all_files = _group_children(entries, prefix, show_missing=True)
+        hidden = (len(all_dirs) - len(dirs)) + (len(all_files) - len(files))
+        if hidden:
+            print(f'\n  ({hidden} missing item{"s" if hidden != 1 else ""} hidden — '
+                  f'use `ott ls -a{" " + prefix if prefix else ""}` to show)')
+
     child = f'{prefix}/<name>' if prefix else '<name>'
     print(f'\n  Drill in with: ott ls {child}   or see everything at once with: ott list')
 
 
-def cmd_tree(path_filter: str | None = None):
-    """Recursive tree view of the archive hierarchy, in the spirit of unix `tree`."""
+def cmd_tree(path_filter: str | None = None, show_all: bool = False):
+    """Recursive tree view of the archive hierarchy, in the spirit of unix `tree`.
+    Entries whose file/repo is missing at last_path are hidden unless show_all.
+    """
     store = get_store()
     entries = store.load_manifest()
     if not entries:
@@ -617,16 +646,25 @@ def cmd_tree(path_filter: str | None = None):
         return
 
     prefix = (path_filter or '').strip('/')
-    dirs, files = _group_children(entries, prefix)
+    dirs, files = _group_children(entries, prefix, show_missing=show_all)
     if not dirs and not files:
+        if not show_all:
+            all_dirs, all_files = _group_children(entries, prefix, show_missing=True)
+            if all_dirs or all_files:
+                print(f'  Nothing present under /{prefix} — everything here is missing '
+                      f'at last_path. Run `ott tree -a{" " + prefix if prefix else ""}` to see it.')
+                return
         print(f'  ✗ nothing found under /{prefix}' if prefix else '  Archive is empty.')
         return
 
     print(f'  /{prefix}' if prefix else '  /')
-    counts = {'dirs': 0, 'files': 0}
+    counts = {'dirs': 0, 'files': 0, 'hidden': 0}
 
     def _walk(cur_prefix: str, indent: str):
-        d, f = _group_children(entries, cur_prefix)
+        d, f = _group_children(entries, cur_prefix, show_missing=show_all)
+        if not show_all:
+            all_d, all_f = _group_children(entries, cur_prefix, show_missing=True)
+            counts['hidden'] += (len(all_d) - len(d)) + (len(all_f) - len(f))
         items = [('D', name) for name in sorted(d)] + \
                 [('F', e) for e in sorted(f, key=lambda e: e['name'])]
         for idx, (kind, item) in enumerate(items):
@@ -645,8 +683,12 @@ def cmd_tree(path_filter: str | None = None):
                 print(f'  {indent}{branch}{e["name"]}  ({e.get("size", 0):,})  {ok}{backed}')
 
     _walk(prefix, '')
+    hidden_note = ''
+    if not show_all and counts['hidden']:
+        hidden_note = (f"  ({counts['hidden']} missing item"
+                        f"{'s' if counts['hidden'] != 1 else ''} hidden — use `ott tree -a` to show)")
     print(f"\n  {counts['dirs']} director{'y' if counts['dirs'] == 1 else 'ies'}, "
-          f"{counts['files']} file{'s' if counts['files'] != 1 else ''}")
+          f"{counts['files']} file{'s' if counts['files'] != 1 else ''}{hidden_note}")
 
 
 def cmd_commit():
@@ -1570,17 +1612,27 @@ class OttShell(cmd.Cmd):
         _run(cmd_list)
 
     def do_ls(self, arg):
-        """ls [dir]  — One-level, unix-style view of the archive hierarchy."""
+        """ls [-a] [dir]  — One-level, unix-style view of the archive hierarchy.
+        Missing entries are hidden unless -a/--all."""
         parts = shlex.split(arg)
-        _run(cmd_ls, parts[0] if parts else None)
+        show_all = False
+        while parts and parts[0] in ('-a', '--all'):
+            show_all = True
+            parts.pop(0)
+        _run(cmd_ls, parts[0] if parts else None, show_all)
 
     def complete_ls(self, text, line, begidx, endidx):
         return self._archive_dir_names(text)
 
     def do_tree(self, arg):
-        """tree [dir]  — Recursive tree view of the archive hierarchy."""
+        """tree [-a] [dir]  — Recursive tree view of the archive hierarchy.
+        Missing entries are hidden unless -a/--all."""
         parts = shlex.split(arg)
-        _run(cmd_tree, parts[0] if parts else None)
+        show_all = False
+        while parts and parts[0] in ('-a', '--all'):
+            show_all = True
+            parts.pop(0)
+        _run(cmd_tree, parts[0] if parts else None, show_all)
 
     def complete_tree(self, text, line, begidx, endidx):
         return self._archive_dir_names(text)
@@ -1821,9 +1873,13 @@ def main():
 
     p_ls = sub.add_parser('ls', help='One-level, unix-style view of the archive hierarchy')
     p_ls.add_argument('dir', nargs='?', default=None)
+    p_ls.add_argument('-a', '--all', action='store_true',
+                      help='Show entries missing at last_path too (hidden by default)')
 
     p_tree = sub.add_parser('tree', help='Recursive tree view of the archive hierarchy')
     p_tree.add_argument('dir', nargs='?', default=None)
+    p_tree.add_argument('-a', '--all', action='store_true',
+                        help='Show entries missing at last_path too (hidden by default)')
 
     sub.add_parser('commit', help='Commit Merkle root to btcvm ledger')
     sub.add_parser('shell',  help='Start interactive shell')
@@ -1875,9 +1931,9 @@ def main():
         elif args.cmd == 'list':
             cmd_list()
         elif args.cmd == 'ls':
-            cmd_ls(args.dir)
+            cmd_ls(args.dir, args.all)
         elif args.cmd == 'tree':
-            cmd_tree(args.dir)
+            cmd_tree(args.dir, args.all)
         elif args.cmd == 'commit':
             cmd_commit()
         elif args.cmd == 'verify':
