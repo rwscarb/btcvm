@@ -20,7 +20,9 @@ Commands:
     ott add photo.jpg video.mp4      add files (images or video)
     ott add -r ./dvds                add a directory tree recursively
     ott status                       current state + Merkle root
-    ott list                         list archived files
+    ott list                         list archived files (full flat dump)
+    ott ls [dir]                     one-level, unix-style hierarchy view
+    ott tree [dir]                   recursive tree view of the hierarchy
     ott commit                       commit Merkle root to Bitcoin ledger
     ott verify photo.jpg             Merkle inclusion proof
     ott verify-chunk video.mp4 3     byte-range inclusion proof (video)
@@ -527,6 +529,124 @@ def cmd_list():
     print(f'\n  Merkle root: {store.current_root()}')
     print('  T: I=image V=video R=repo  loc: ✅=at last_path ❌=path missing (run ott find)  '
           'obj: 📦=archive copy stored ·=none (run ott backfill)')
+
+
+def _virtual_path(e: dict) -> str:
+    """Path used for hierarchy grouping — orig_path for files added via `add`,
+    falling back to name for repos and older entries that predate orig_path."""
+    return e.get('orig_path') or e['name']
+
+
+def _entry_status_icons(store: 'OttStore', e: dict) -> tuple[str, str]:
+    etype = e.get('type', 'image')
+    is_repo = etype == 'repo'
+    path_ok = (os.path.isdir if is_repo else os.path.isfile)(e.get('last_path', ''))
+    ok = '✅ ' if path_ok else '❌ '
+    backed = '📦' if (not is_repo and store.has_object(e['sha256'])) else '·'
+    return ok, backed
+
+
+def _group_children(entries: list[dict], prefix: str) -> tuple[dict[str, list], list[dict]]:
+    """Split entries into (dirs, files) directly under prefix ('' = archive root).
+    dirs: {dirname: [entries under it, at any depth]}
+    files: [entries whose virtual path sits directly at this level]
+    """
+    prefix_parts = [p for p in prefix.split('/') if p] if prefix else []
+    dirs: dict[str, list] = {}
+    files: list = []
+    for e in entries:
+        parts = [p for p in _virtual_path(e).split('/') if p]
+        if parts[:len(prefix_parts)] != prefix_parts:
+            continue
+        rest = parts[len(prefix_parts):]
+        if not rest:
+            continue
+        if len(rest) == 1:
+            files.append(e)
+        else:
+            dirs.setdefault(rest[0], []).append(e)
+    return dirs, files
+
+
+def cmd_ls(path_filter: str | None = None):
+    """One-level, unix-`ls`-style view of the archive hierarchy (orig_path-based).
+    Use `ott list`/`l` for the full flat dump with every path in one table.
+    """
+    store = get_store()
+    entries = store.load_manifest()
+    if not entries:
+        print('  Archive is empty.')
+        return
+
+    prefix = (path_filter or '').strip('/')
+    dirs, files = _group_children(entries, prefix)
+    if not dirs and not files:
+        print(f'  ✗ nothing found under /{prefix}' if prefix else '  Archive is empty.')
+        return
+
+    print(f'  /{prefix}' if prefix else '  /')
+    print(f'  {"T":<2} {"name":<44} {"size":>14}  {"loc":<3} {"obj":<3}')
+    print('  ' + '-' * 90)
+    for name in sorted(dirs):
+        sub = dirs[name]
+        total_size = sum(e.get('size', 0) for e in sub)
+        n_missing = sum(1 for e in sub
+                        if e.get('type') != 'repo' and not os.path.isfile(e.get('last_path', '')))
+        ok = '✅ ' if n_missing == 0 else '❌ '
+        n = len(sub)
+        print(f'  {"D":<2} {name + "/":<44} {total_size:>14,}  {ok} ·   '
+              f'({n} item{"s" if n != 1 else ""})')
+    for e in sorted(files, key=lambda e: e['name']):
+        etype = e.get('type', 'image')
+        t = {'video': 'V', 'repo': 'R'}.get(etype, 'I')
+        ok, backed = _entry_status_icons(store, e)
+        display = e['name']
+        if len(display) > 44:
+            display = '…' + display[-43:]
+        print(f'  {t:<2} {display:<44} {e.get("size", 0):>14,}  {ok} {backed}')
+    child = f'{prefix}/<name>' if prefix else '<name>'
+    print(f'\n  Drill in with: ott ls {child}   or see everything at once with: ott list')
+
+
+def cmd_tree(path_filter: str | None = None):
+    """Recursive tree view of the archive hierarchy, in the spirit of unix `tree`."""
+    store = get_store()
+    entries = store.load_manifest()
+    if not entries:
+        print('  Archive is empty.')
+        return
+
+    prefix = (path_filter or '').strip('/')
+    dirs, files = _group_children(entries, prefix)
+    if not dirs and not files:
+        print(f'  ✗ nothing found under /{prefix}' if prefix else '  Archive is empty.')
+        return
+
+    print(f'  /{prefix}' if prefix else '  /')
+    counts = {'dirs': 0, 'files': 0}
+
+    def _walk(cur_prefix: str, indent: str):
+        d, f = _group_children(entries, cur_prefix)
+        items = [('D', name) for name in sorted(d)] + \
+                [('F', e) for e in sorted(f, key=lambda e: e['name'])]
+        for idx, (kind, item) in enumerate(items):
+            is_last = idx == len(items) - 1
+            branch = '└── ' if is_last else '├── '
+            cont = '    ' if is_last else '│   '
+            if kind == 'D':
+                counts['dirs'] += 1
+                print(f'  {indent}{branch}{item}/')
+                child_prefix = f'{cur_prefix}/{item}' if cur_prefix else item
+                _walk(child_prefix, indent + cont)
+            else:
+                counts['files'] += 1
+                e = item
+                ok, backed = _entry_status_icons(store, e)
+                print(f'  {indent}{branch}{e["name"]}  ({e.get("size", 0):,})  {ok}{backed}')
+
+    _walk(prefix, '')
+    print(f"\n  {counts['dirs']} director{'y' if counts['dirs'] == 1 else 'ies'}, "
+          f"{counts['files']} file{'s' if counts['files'] != 1 else ''}")
 
 
 def cmd_commit():
@@ -1446,8 +1566,37 @@ class OttShell(cmd.Cmd):
         _run(cmd_status)
 
     def do_list(self, _arg):
-        """list  — List all archived files."""
+        """list  — List all archived files (full flat dump, every path in one table)."""
         _run(cmd_list)
+
+    def do_ls(self, arg):
+        """ls [dir]  — One-level, unix-style view of the archive hierarchy."""
+        parts = shlex.split(arg)
+        _run(cmd_ls, parts[0] if parts else None)
+
+    def complete_ls(self, text, line, begidx, endidx):
+        return self._archive_dir_names(text)
+
+    def do_tree(self, arg):
+        """tree [dir]  — Recursive tree view of the archive hierarchy."""
+        parts = shlex.split(arg)
+        _run(cmd_tree, parts[0] if parts else None)
+
+    def complete_tree(self, text, line, begidx, endidx):
+        return self._archive_dir_names(text)
+
+    def _archive_dir_names(self, text: str) -> list[str]:
+        """Top-level virtual directory names, for tab-completing ls/tree args."""
+        try:
+            entries = get_store().load_manifest()
+        except OttNotFoundError:
+            return []
+        names = set()
+        for e in entries:
+            parts = [p for p in _virtual_path(e).split('/') if p]
+            if len(parts) > 1:
+                names.add(parts[0])
+        return [n for n in names if n.startswith(text)]
 
     def do_commit(self, _arg):
         """commit  — Commit Merkle root to btcvm ledger."""
@@ -1611,10 +1760,6 @@ class OttShell(cmd.Cmd):
         """l   — list"""
         self.do_list(a)
 
-    def do_ls(self, a):
-        """ls  — list"""
-        self.do_list(a)
-
     def do_lls(self, a):
         """lls [path]  — local list (list directory contents on disk)"""
         self.do_ls_dir(a)
@@ -1672,7 +1817,14 @@ def main():
                         help='Recurse into directories (skips .ott/.git)')
 
     sub.add_parser('status', help='Show archive status and Merkle root')
-    sub.add_parser('list',   help='List all archived files')
+    sub.add_parser('list',   help='List all archived files (full flat dump)')
+
+    p_ls = sub.add_parser('ls', help='One-level, unix-style view of the archive hierarchy')
+    p_ls.add_argument('dir', nargs='?', default=None)
+
+    p_tree = sub.add_parser('tree', help='Recursive tree view of the archive hierarchy')
+    p_tree.add_argument('dir', nargs='?', default=None)
+
     sub.add_parser('commit', help='Commit Merkle root to btcvm ledger')
     sub.add_parser('shell',  help='Start interactive shell')
 
@@ -1722,6 +1874,10 @@ def main():
             cmd_status()
         elif args.cmd == 'list':
             cmd_list()
+        elif args.cmd == 'ls':
+            cmd_ls(args.dir)
+        elif args.cmd == 'tree':
+            cmd_tree(args.dir)
         elif args.cmd == 'commit':
             cmd_commit()
         elif args.cmd == 'verify':
