@@ -551,7 +551,7 @@ def _breadcrumb_paths(entries: list[dict]) -> tuple[str, dict[str, str]]:
     return breadcrumb, display
 
 
-def cmd_list():
+def cmd_list(human: bool = True):
     store = get_store()
     entries = store.load_manifest()
     if not entries:
@@ -575,8 +575,9 @@ def cmd_list():
         display = display_paths.get(e['sha256']) or e.get('orig_path') or e['name']
         if len(display) > 44:
             display = '…' + display[-43:]
+        size_str = _fmt_size(e.get('size', 0), human)
         print(f'  {i:<4} {t:<2} {display:<44} {e["sha256"][:16]}…  '
-              f'{e.get("size", 0):>14,}  {ok} {backed}')
+              f'{size_str:>14}  {ok} {backed}')
     print(f'\n  Merkle root: {store.current_root()}')
     print('  T: I=image V=video R=repo  loc: ✅=at last_path ❌=path missing (run ott find)  '
           'obj: 📦=archive copy stored ·=none (run ott backfill)')
@@ -595,6 +596,19 @@ def _entry_status_icons(store: 'OttStore', e: dict) -> tuple[str, str]:
     ok = '✅ ' if path_ok else '❌ '
     backed = '📦' if (not is_repo and store.has_object(e['sha256'])) else '·'
     return ok, backed
+
+
+def _human_size(n: int) -> str:
+    size = float(n)
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if size < 1024:
+            return f'{size:.0f} {unit}' if unit == 'B' else f'{size:.1f} {unit}'
+        size /= 1024
+    return f'{size:.1f} PB'
+
+
+def _fmt_size(n: int, human: bool) -> str:
+    return _human_size(n) if human else f'{n:,}'
 
 
 def _is_missing(e: dict) -> bool:
@@ -649,7 +663,8 @@ def _visibility_predicate(show_all: bool, tag: str | None):
     return pred
 
 
-def cmd_ls(path_filter: str | None = None, show_all: bool = False, tag: str | None = None):
+def cmd_ls(path_filter: str | None = None, show_all: bool = False, tag: str | None = None,
+          human: bool = True):
     """One-level, unix-`ls`-style view of the archive hierarchy (orig_path-based).
     Entries whose file/repo is missing at last_path are hidden unless show_all.
     Use `ott list`/`l` for the full flat dump with every path in one table.
@@ -684,7 +699,8 @@ def cmd_ls(path_filter: str | None = None, show_all: bool = False, tag: str | No
         n_missing = sum(1 for e in sub if _is_missing(e))
         ok = '✅ ' if n_missing == 0 else '❌ '
         n = len(sub)
-        print(f'  {"D":<2} {name + "/":<44} {total_size:>14,}  {ok} ·   '
+        size_str = _fmt_size(total_size, human)
+        print(f'  {"D":<2} {name + "/":<44} {size_str:>14}  {ok} ·   '
               f'({n} item{"s" if n != 1 else ""})')
     for e in sorted(files, key=lambda e: e['name']):
         etype = e.get('type', 'image')
@@ -693,7 +709,8 @@ def cmd_ls(path_filter: str | None = None, show_all: bool = False, tag: str | No
         display = e['name']
         if len(display) > 44:
             display = '…' + display[-43:]
-        print(f'  {t:<2} {display:<44} {e.get("size", 0):>14,}  {ok} {backed}')
+        size_str = _fmt_size(e.get('size', 0), human)
+        print(f'  {t:<2} {display:<44} {size_str:>14}  {ok} {backed}')
 
     if not show_all:
         vis_missing_only = _visibility_predicate(False, tag)
@@ -710,9 +727,13 @@ def cmd_ls(path_filter: str | None = None, show_all: bool = False, tag: str | No
     print(f'\n  Drill in with: ott ls {child}   or see everything at once with: ott list')
 
 
-def cmd_tree(path_filter: str | None = None, show_all: bool = False, tag: str | None = None):
+def cmd_tree(path_filter: str | None = None, show_all: bool = False, tag: str | None = None,
+            max_depth: int = 1, human: bool = True):
     """Recursive tree view of the archive hierarchy, in the spirit of unix `tree`.
     Entries whose file/repo is missing at last_path are hidden unless show_all.
+    Descends max_depth *real* (post-collapse) branch levels — depth 1 shows
+    the top-level breakdown only; use -d/--depth (or 0 for unlimited) to go
+    further.
     """
     store = get_store()
     entries = store.load_manifest()
@@ -737,8 +758,9 @@ def cmd_tree(path_filter: str | None = None, show_all: bool = False, tag: str | 
     if tag:
         print(f'  (filtered to tag: {tag})')
     counts = {'dirs': 0, 'files': 0, 'hidden': 0}
+    truncated = [False]
 
-    def _walk(cur_prefix: str, indent: str, chain: str = ''):
+    def _walk(cur_prefix: str, indent: str, chain: str = '', depth: int = 1):
         d, f = _group_children(entries, cur_prefix, pred)
         if not show_all:
             all_d, all_f = _group_children(entries, cur_prefix, _visibility_predicate(True, tag))
@@ -747,11 +769,12 @@ def cmd_tree(path_filter: str | None = None, show_all: bool = False, tag: str | 
         # Collapse a run of directories that each have exactly one child and
         # no sibling files — "Desktop/" -> "home movies/" folds into a
         # single "Desktop/home movies/" line instead of two nested levels
-        # that carry no branching information.
+        # that carry no branching information. Doesn't consume depth: it's
+        # not a real branch point.
         if len(d) == 1 and not f:
             only_name = next(iter(d))
             child_prefix = f'{cur_prefix}/{only_name}' if cur_prefix else only_name
-            _walk(child_prefix, indent, chain + only_name + '/')
+            _walk(child_prefix, indent, chain + only_name + '/', depth)
             return
 
         items = [('D', name) for name in sorted(d)] + \
@@ -764,12 +787,16 @@ def cmd_tree(path_filter: str | None = None, show_all: bool = False, tag: str | 
                 counts['dirs'] += 1
                 print(f'  {indent}{branch}{chain}{item}/')
                 child_prefix = f'{cur_prefix}/{item}' if cur_prefix else item
-                _walk(child_prefix, indent + cont)
+                if max_depth and depth >= max_depth:
+                    truncated[0] = True
+                else:
+                    _walk(child_prefix, indent + cont, '', depth + 1)
             else:
                 counts['files'] += 1
                 e = item
                 ok, backed = _entry_status_icons(store, e)
-                print(f'  {indent}{branch}{chain}{e["name"]}  ({e.get("size", 0):,})  {ok}{backed}')
+                print(f'  {indent}{branch}{chain}{e["name"]}  '
+                      f'({_fmt_size(e.get("size", 0), human)})  {ok}{backed}')
 
     _walk(prefix, '')
     hidden_note = ''
@@ -777,8 +804,9 @@ def cmd_tree(path_filter: str | None = None, show_all: bool = False, tag: str | 
         flag = f'-a --tag {tag}' if tag else '-a'
         hidden_note = (f"  ({counts['hidden']} missing item"
                         f"{'s' if counts['hidden'] != 1 else ''} hidden — use `ott tree {flag}` to show)")
+    depth_note = f'  (depth {max_depth} — use `ott tree -d0` for unlimited)' if truncated[0] else ''
     print(f"\n  {counts['dirs']} director{'y' if counts['dirs'] == 1 else 'ies'}, "
-          f"{counts['files']} file{'s' if counts['files'] != 1 else ''}{hidden_note}")
+          f"{counts['files']} file{'s' if counts['files'] != 1 else ''}{hidden_note}{depth_note}")
 
 
 def _compile_tag_pattern(pattern: str):
@@ -1843,46 +1871,75 @@ class OttShell(cmd.Cmd):
         """status  — Show archive status and current Merkle root."""
         _run(cmd_status)
 
-    def do_list(self, _arg):
-        """list  — List all archived files (full flat dump, every path in one table)."""
-        _run(cmd_list)
+    def do_list(self, arg):
+        """list [-b]  — List all archived files (full flat dump, every path in
+        one table). Sizes are human-readable (e.g. 1.1 GB) unless -b/--bytes."""
+        parts = shlex.split(arg)
+        human = not any(p in ('-b', '--bytes') for p in parts)
+        _run(cmd_list, human)
 
-    def _parse_ls_flags(self, arg: str) -> tuple[list[str], bool, str | None]:
-        """Shared -a/--all and -t/--tag <name> parsing for ls/tree."""
+    def _parse_ls_flags(self, arg: str) -> tuple[list[str], bool, str | None, bool]:
+        """Shared -a/--all, -t/--tag <name>, and -b/--bytes parsing for ls/tree."""
         parts = shlex.split(arg)
         show_all = False
         tag = None
+        human = True
         rest = []
         i = 0
         while i < len(parts):
             if parts[i] in ('-a', '--all'):
                 show_all = True
+            elif parts[i] in ('-b', '--bytes'):
+                human = False
             elif parts[i] in ('-t', '--tag') and i + 1 < len(parts):
                 i += 1
                 tag = parts[i]
             else:
                 rest.append(parts[i])
             i += 1
-        return rest, show_all, tag
+        return rest, show_all, tag, human
+
+    def _parse_depth_flag(self, parts: list[str]) -> tuple[list[str], int]:
+        """Parse -dN / -d N / --depth N / --depth=N for tree (0 = unlimited)."""
+        depth = 1
+        rest = []
+        i = 0
+        while i < len(parts):
+            p = parts[i]
+            if p.startswith('-d') and p[2:].isdigit():
+                depth = int(p[2:])
+            elif p in ('-d', '--depth') and i + 1 < len(parts) and parts[i + 1].isdigit():
+                i += 1
+                depth = int(parts[i])
+            elif p.startswith('--depth=') and p[8:].isdigit():
+                depth = int(p[8:])
+            else:
+                rest.append(p)
+            i += 1
+        return rest, depth
 
     def do_ls(self, arg):
-        """ls [-a] [-t tag] [dir]  — One-level, unix-style view of the archive
-        hierarchy, relative to the current archive dir (see cd). Missing
-        entries are hidden unless -a/--all."""
-        parts, show_all, tag = self._parse_ls_flags(arg)
+        """ls [-a] [-t tag] [-b] [dir]  — One-level, unix-style view of the
+        archive hierarchy, relative to the current archive dir (see cd).
+        Missing entries are hidden unless -a/--all. Sizes are human-readable
+        unless -b/--bytes."""
+        parts, show_all, tag, human = self._parse_ls_flags(arg)
         target = self._resolve_archive_path(parts[0] if parts else '')
-        _run(cmd_ls, target, show_all, tag)
+        _run(cmd_ls, target, show_all, tag, human)
 
     def complete_ls(self, text, line, begidx, endidx):
         return self._archive_dir_names(text)
 
     def do_tree(self, arg):
-        """tree [-a] [-t tag] [dir]  — Recursive tree view of the archive
-        hierarchy, relative to the current archive dir (see cd). Missing
-        entries are hidden unless -a/--all."""
-        parts, show_all, tag = self._parse_ls_flags(arg)
+        """tree [-a] [-t tag] [-dN] [-b] [dir]  — Recursive tree view of the
+        archive hierarchy, relative to the current archive dir (see cd).
+        Missing entries are hidden unless -a/--all. Depth defaults to 1 real
+        (post-collapse) level; -d3 goes 3 deep, -d0 is unlimited. Sizes are
+        human-readable unless -b/--bytes."""
+        parts, show_all, tag, human = self._parse_ls_flags(arg)
+        parts, depth = self._parse_depth_flag(parts)
         target = self._resolve_archive_path(parts[0] if parts else '')
-        _run(cmd_tree, target, show_all, tag)
+        _run(cmd_tree, target, show_all, tag, depth, human)
 
     def complete_tree(self, text, line, begidx, endidx):
         return self._archive_dir_names(text)
@@ -2197,19 +2254,28 @@ def main():
                         help='Recurse into directories (skips .ott/.git)')
 
     sub.add_parser('status', help='Show archive status and Merkle root')
-    sub.add_parser('list',   help='List all archived files (full flat dump)')
+
+    p_list = sub.add_parser('list', help='List all archived files (full flat dump)')
+    p_list.add_argument('-b', '--bytes', action='store_true',
+                        help='Show exact byte counts instead of human-readable sizes')
 
     p_ls = sub.add_parser('ls', help='One-level, unix-style view of the archive hierarchy')
     p_ls.add_argument('dir', nargs='?', default=None)
     p_ls.add_argument('-a', '--all', action='store_true',
                       help='Show entries missing at last_path too (hidden by default)')
     p_ls.add_argument('-t', '--tag', default=None, help='Only show entries carrying this tag')
+    p_ls.add_argument('-b', '--bytes', action='store_true',
+                      help='Show exact byte counts instead of human-readable sizes')
 
     p_tree = sub.add_parser('tree', help='Recursive tree view of the archive hierarchy')
     p_tree.add_argument('dir', nargs='?', default=None)
     p_tree.add_argument('-a', '--all', action='store_true',
                         help='Show entries missing at last_path too (hidden by default)')
     p_tree.add_argument('-t', '--tag', default=None, help='Only show entries carrying this tag')
+    p_tree.add_argument('-b', '--bytes', action='store_true',
+                        help='Show exact byte counts instead of human-readable sizes')
+    p_tree.add_argument('-d', '--depth', type=int, default=1,
+                        help='Real (post-collapse) levels to descend; 0 = unlimited (default: 1)')
 
     p_tag = sub.add_parser('tag', help='Bulk-tag entries by regex match against their archive path')
     p_tag.add_argument('subcmd', choices=['add', 'rm', 'list'], metavar='add|rm|list')
@@ -2267,11 +2333,11 @@ def main():
         elif args.cmd == 'status':
             cmd_status()
         elif args.cmd == 'list':
-            cmd_list()
+            cmd_list(not args.bytes)
         elif args.cmd == 'ls':
-            cmd_ls(args.dir, args.all, args.tag)
+            cmd_ls(args.dir, args.all, args.tag, not args.bytes)
         elif args.cmd == 'tree':
-            cmd_tree(args.dir, args.all, args.tag)
+            cmd_tree(args.dir, args.all, args.tag, args.depth, not args.bytes)
         elif args.cmd == 'tag':
             cmd_tag(args.subcmd, args.args)
         elif args.cmd == 'commit':
