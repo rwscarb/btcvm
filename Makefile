@@ -1,4 +1,5 @@
 .PHONY: help install dev test lint fix run commit status clean completion
+.PHONY: ott-status ott-list ott-commit ott-clean ott-repo-add ott-tag ott-push ott-snapshot ott-release add verify-file
 
 PYTHON     ?= python3
 VENV_NAME  ?= btcvm
@@ -26,13 +27,20 @@ help:
 	@echo "  make verify        Verify ledger against Bitcoin"
 	@echo ""
 	@echo "ott:"
-	@echo "  make ott-status  Show archive status"
-	@echo "  make ott-list    List archived files"
-	@echo "  make ott-commit  Commit Merkle root to ledger"
-	@echo "  make ott-clean   Remove manifest and ledger"
+	@echo "  make ott-status                  Show archive status"
+	@echo "  make ott-list                    List archived files"
+	@echo "  make ott-commit                  Commit Merkle root to ledger"
+	@echo "  make ott-clean                   Remove flat manifest/ledger"
+	@echo "  make ott-repo-add                Update repo record to HEAD"
+	@echo "  make ott-snapshot                repo-add + commit root"
+	@echo "  make ott-tag [OTT_NEXT_TAG=v1.x] Sign tag + record fingerprint"
+	@echo "  make ott-push [OTT_NEXT_TAG=v1.x] Push commits + tag + commit root"
+	@echo "  make ott-release [OTT_NEXT_TAG=v1.x] Full: tag + push + commit"
 	@echo ""
 	@echo "  make add FILE=path/to/file.jpg   Add file to archive"
 	@echo "  make verify-file FILE=path       Verify file inclusion"
+	@echo ""
+	@echo "  Overrides: OTT_REPO=. OTT_NEXT_TAG=v1.2.3 OTT_KEY=DEADBEEF OTT_MSG=\"msg\""
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
@@ -86,6 +94,13 @@ verify:
 
 # ── ott ─────────────────────────────────────────────────────────────────────
 
+# Configurable vars (override on command line)
+OTT_REPO     ?= .
+OTT_KEY      ?=
+OTT_MSG      ?=
+# OTT_NEXT_TAG: auto-increments patch; override: make ott-tag OTT_NEXT_TAG=v2.0.0
+OTT_NEXT_TAG ?= _auto_
+
 ott-status:
 	$(OTT) status
 
@@ -110,6 +125,48 @@ ifndef FILE
 	$(error FILE is not set. Usage: make verify-file FILE=path/to/file)
 endif
 	$(OTT) verify $(FILE)
+
+## Update archived repo record to current HEAD
+ott-repo-add:
+	$(OTT) repo add $(OTT_REPO)
+
+## Create a signed git tag and record GPG fingerprint in ott
+## Usage: make ott-tag [OTT_NEXT_TAG=v1.2.3] [OTT_KEY=DEADBEEF] [OTT_MSG="msg"]
+ott-tag: ott-repo-add
+	@TAG="$(OTT_NEXT_TAG)"; \
+	 if [ "$$TAG" = "_auto_" ]; then \
+	   PREV=$$(git -C $(OTT_REPO) describe --tags --abbrev=0 2>/dev/null || echo ""); \
+	   if echo "$$PREV" | grep -qE '^v?[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+	     TAG=$$(echo "$$PREV" | python3 -c "import sys,re; m=re.match(r'v?(\d+)\.(\d+)\.(\d+)',sys.stdin.read().strip()); print('v{}.{}.{}'.format(m[1],m[2],int(m[3])+1))"); \
+	   else \
+	     TAG="v0.0.1"; \
+	   fi; \
+	 fi; \
+	 echo "  Tagging as $$TAG"; \
+	 $(OTT) repo tag $(OTT_REPO) $$TAG $(OTT_KEY) $(if $(OTT_MSG),"$(OTT_MSG)"); \
+	 echo ""; \
+	 echo "  Done. Run: make ott-push OTT_NEXT_TAG=$$TAG"
+
+## Push commits + signed tag to origin, then commit ott Merkle root
+## Usage: make ott-push [OTT_NEXT_TAG=v1.2.3]
+ott-push: ott-repo-add
+	@echo "  Pushing commits to origin..."
+	git -C $(OTT_REPO) push origin HEAD
+	@echo "  Pushing tag $(OTT_NEXT_TAG)..."
+	git -C $(OTT_REPO) push origin $(OTT_NEXT_TAG)
+	@echo "  Committing ott Merkle root to ledger..."
+	$(OTT) commit
+
+## Snapshot: update repo record + commit Merkle root (no tag, no push)
+ott-snapshot: ott-repo-add ott-commit
+	@echo "  Snapshot complete."
+
+## Full release: tag → push → commit root
+## Usage: make ott-release [OTT_NEXT_TAG=v1.2.3] [OTT_KEY=DEADBEEF] [OTT_MSG="release"]
+ott-release: ott-tag ott-push
+	@echo ""
+	@echo "✅ Release $(OTT_NEXT_TAG) complete."
+	@echo "   To anchor on-chain: python broadcast.py <commitment above>"
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 
