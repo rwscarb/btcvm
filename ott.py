@@ -371,6 +371,7 @@ def cmd_add(paths: list[str]):
         entry = {
             'sha256':     digest,
             'name':       os.path.basename(path),
+            'orig_path':  os.path.relpath(abs_path, os.getcwd()),
             'last_path':  abs_path,
             'size':       size,
             'added':      time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
@@ -429,15 +430,18 @@ def cmd_list():
     if not entries:
         print('  Archive is empty.')
         return
-    print(f'  {"#":<4} {"T":<2} {"name":<36} {"sha256":<18} {"size":>10}  {"  "}')
-    print('  ' + '-' * 88)
+    print(f'  {"#":<4} {"T":<2} {"path":<44} {"sha256":<18} {"size":>10}  {"  "}')
+    print('  ' + '-' * 96)
     for i, e in enumerate(entries):
         etype = e.get('type', 'image')
         t = {'video': 'V', 'repo': 'R'}.get(etype, 'I')
         is_repo = etype == 'repo'
         path_ok = (os.path.isdir if is_repo else os.path.isfile)(e.get('last_path', ''))
         ok = '✅' if path_ok else '⚠️ '
-        print(f'  {i:<4} {t:<2} {e["name"]:<36} {e["sha256"][:16]}…  '
+        display = e.get('orig_path') or e['name']
+        if len(display) > 44:
+            display = '…' + display[-43:]
+        print(f'  {i:<4} {t:<2} {display:<44} {e["sha256"][:16]}…  '
               f'{e.get("size", 0):>10,}  {ok}')
     print(f'\n  Merkle root: {store.current_root()}')
     print('  T: I=image V=video R=repo  ✅=at last_path  ⚠️ =path missing (run ott find)')
@@ -488,6 +492,37 @@ def cmd_commit():
     cmd_qr(commitment, label='commitment QR')
 
 
+def _resolve_entry(entries: list[dict], ref: str, type_filter: str | None = None):
+    """Resolve a hash-prefix / orig_path / basename reference to one manifest entry.
+
+    Returns (entry_or_None, error_or_None). Basename matches that hit more than
+    one entry (e.g. same filename archived from different subfolders) are
+    reported as an error instead of silently picking the first one.
+    """
+    pool = entries if type_filter is None else [e for e in entries if e.get('type') == type_filter]
+
+    if len(ref) >= 6:
+        hash_matches = [e for e in pool if e['sha256'].startswith(ref)]
+        if len(hash_matches) == 1:
+            return hash_matches[0], None
+
+    path_matches = [e for e in pool if e.get('orig_path') == ref]
+    if len(path_matches) == 1:
+        return path_matches[0], None
+
+    name_matches = [e for e in pool if e['name'] == ref]
+    if len(name_matches) == 1:
+        return name_matches[0], None
+    if len(name_matches) > 1:
+        lines = '\n'.join(
+            f'    {e.get("orig_path", e["name"])}  ({e["sha256"][:12]}…)' for e in name_matches
+        )
+        return None, (f'  ✗ "{ref}" is ambiguous — matches {len(name_matches)} files:\n{lines}\n'
+                       f'  Use the full path or a hash prefix to disambiguate.')
+
+    return None, None
+
+
 def cmd_verify(path_or_name: str):
     store = get_store()
     entries = store.load_manifest()
@@ -499,7 +534,10 @@ def cmd_verify(path_or_name: str):
         digest = sha256_file(abs_path)
         source = 'live file'
     else:
-        entry = next((e for e in entries if e['name'] == name), None)
+        entry, err = _resolve_entry(entries, path_or_name)
+        if err:
+            print(err)
+            return
         if entry is None:
             print(f'  ✗ {name} not in archive and not found on disk')
             return
@@ -542,8 +580,10 @@ def cmd_verify_chunk(path_or_name: str, chunk_idx: int):
     store = get_store()
     entries = store.load_manifest()
     name = os.path.basename(path_or_name)
-    entry = next((e for e in entries if e['name'] == name and e.get('type') == 'video'), None)
-
+    entry, err = _resolve_entry(entries, path_or_name, type_filter='video')
+    if err:
+        print(err)
+        return
     if entry is None:
         print(f'  ✗ {name} not in archive as a video file')
         return
@@ -605,11 +645,10 @@ def cmd_find(name_or_hash: str, search_root: str | None = None):
     store = get_store()
     entries = store.load_manifest()
 
-    entry = next(
-        (e for e in entries
-         if e['name'] == name_or_hash or e['sha256'].startswith(name_or_hash)),
-        None,
-    )
+    entry, err = _resolve_entry(entries, name_or_hash)
+    if err:
+        print(err)
+        return
     if entry is None:
         print(f'  ✗ {name_or_hash} not in archive')
         return
@@ -667,11 +706,10 @@ def cmd_mv(name_or_hash: str, new_path: str):
     store = get_store()
     entries = store.load_manifest()
 
-    entry = next(
-        (e for e in entries
-         if e['name'] == name_or_hash or e['sha256'].startswith(name_or_hash)),
-        None,
-    )
+    entry, err = _resolve_entry(entries, name_or_hash)
+    if err:
+        print(err)
+        return
     if entry is None:
         print(f'  ✗ {name_or_hash} not in archive')
         return
@@ -1359,7 +1397,7 @@ class OttShell(cmd.Cmd):
             print(f'  ✗ {e}')
 
     def do_ls_dir(self, arg):
-        """lsd [path]  — List directory contents."""
+        """ls_dir [path]  — List directory contents on disk (alias: lls)."""
         path = os.path.expanduser(shlex.split(arg)[0]) if arg.strip() else '.'
         try:
             entries = sorted(os.listdir(path))
@@ -1407,6 +1445,10 @@ class OttShell(cmd.Cmd):
     def do_ls(self, a):
         """ls  — list"""
         self.do_list(a)
+
+    def do_lls(self, a):
+        """lls [path]  — local list (list directory contents on disk)"""
+        self.do_ls_dir(a)
 
     def do_st(self, a):
         """st  — status"""
