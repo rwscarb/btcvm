@@ -513,12 +513,53 @@ def cmd_status():
         print('  Status:      not yet committed to Bitcoin')
 
 
+def _breadcrumb_paths(entries: list[dict]) -> tuple[str, dict[str, str]]:
+    """Find the leading path segments shared by the majority of entries, to
+    print once at the top instead of repeating on every row. Returns
+    (breadcrumb, {sha256: display_path}); entries outside the majority group
+    (different DVD batch, a lone file at root, ...) show their full path.
+    """
+    paths = {e['sha256']: [p for p in _virtual_path(e).split('/') if p] for e in entries}
+    multi = {k: v for k, v in paths.items() if len(v) > 1}
+    if len(multi) < 2:
+        return '', {k: '/'.join(v) for k, v in paths.items()}
+
+    first_seg_counts = {}
+    for v in multi.values():
+        first_seg_counts[v[0]] = first_seg_counts.get(v[0], 0) + 1
+    majority_first = max(first_seg_counts, key=first_seg_counts.get)
+    if first_seg_counts[majority_first] < 2:
+        return '', {k: '/'.join(v) for k, v in paths.items()}
+
+    majority = {k: v for k, v in multi.items() if v[0] == majority_first}
+    shortest_len = min(len(v) for v in majority.values())
+    prefix: list[str] = []
+    for i in range(shortest_len - 1):  # leave at least the filename itself unstripped
+        seg_set = {v[i] for v in majority.values()}
+        if len(seg_set) == 1:
+            prefix.append(next(iter(seg_set)))
+        else:
+            break
+
+    if not prefix:
+        return '', {k: '/'.join(v) for k, v in paths.items()}
+
+    breadcrumb = '/'.join(prefix) + '/'
+    display = {}
+    for k, v in paths.items():
+        display[k] = '/'.join(v[len(prefix):]) if v[:len(prefix)] == prefix else '/'.join(v)
+    return breadcrumb, display
+
+
 def cmd_list():
     store = get_store()
     entries = store.load_manifest()
     if not entries:
         print('  Archive is empty.')
         return
+    breadcrumb, display_paths = _breadcrumb_paths(entries)
+    if breadcrumb:
+        print(f'  Base: /{breadcrumb}  (shared by most entries below; shown in full where it differs)')
     print(f'  {"#":<4} {"T":<2} {"path":<44} {"sha256":<18} {"size":>14}  {"loc":<3} {"obj":<3}')
     print('  ' + '-' * 100)
     for i, e in enumerate(entries):
@@ -531,7 +572,7 @@ def cmd_list():
         # terminals render it at different widths, which ragged the columns.
         ok = '✅ ' if path_ok else '❌ '
         backed = '📦' if (not is_repo and store.has_object(e['sha256'])) else '·'
-        display = e.get('orig_path') or e['name']
+        display = display_paths.get(e['sha256']) or e.get('orig_path') or e['name']
         if len(display) > 44:
             display = '…' + display[-43:]
         print(f'  {i:<4} {t:<2} {display:<44} {e["sha256"][:16]}…  '
