@@ -507,10 +507,48 @@ def cmd_status():
         print(f'  Last commit: block {last.get("block_height", "?")} at {last.get("ts", "?")}')
         if last.get('merkle_root') == root:
             print('  Status:      ✅ root is committed')
+            _print_root_tx(last)
         else:
             print('  Status:      ⚠️  uncommitted changes since last commit')
     else:
         print('  Status:      not yet committed to Bitcoin')
+
+
+def _print_root_tx(entry: dict):
+    """Look up the on-chain OP_RETURN tx for a committed ledger entry and
+    print a link + QR code to view it. No tx_hash is persisted anywhere —
+    `ott commit` and `broadcast.py` are separate manual steps and the
+    broadcast's return value is never saved back — so this always does a
+    live lookup rather than reading a stored field."""
+    from verify import API_MAIN, API_TEST, check_op_return, fetch
+
+    height = entry.get('block_height')
+    block_hash = entry.get('block_hash')
+    commitment = entry.get('commitment')
+    if not (height and block_hash and commitment):
+        return
+
+    net_label = api = explorer = None
+    for label, candidate_api, explorer_base in (
+        ('mainnet', API_MAIN, 'https://blockstream.info/tx/'),
+        ('testnet', API_TEST, 'https://blockstream.info/testnet/tx/'),
+    ):
+        if fetch(f'{candidate_api}/block-height/{height}') == block_hash:
+            net_label, api, explorer = label, candidate_api, explorer_base
+            break
+    if not api:
+        print('  On-chain tx: ✗ could not reach Bitcoin to look up (offline?)')
+        return
+
+    found, detail = check_op_return(block_hash, commitment, api)
+    if found:
+        url = explorer + detail
+        print(f'  On-chain tx: {detail}  [{net_label}]')
+        print(f'  {url}')
+        cmd_qr(url, label='view transaction')
+    else:
+        print(f'  On-chain tx: not found ({detail}) — may not be broadcast yet')
+        print(f'    To broadcast: python broadcast.py {commitment}')
 
 
 def _breadcrumb_paths(entries: list[dict]) -> tuple[str, dict[str, str]]:
