@@ -1077,7 +1077,7 @@ def cmd_verify_chain(check_txs: bool = False):
     (no separator) — different from btcvm's own verify.py, which uses
     SHA256(f"{block_hash}:{root}"). Don't point verify.py at an ott ledger;
     the commitments won't recompute correctly."""
-    from verify import API_MAIN, check_op_return, fetch
+    from verify import API_MAIN, API_TEST, check_op_return, fetch
 
     store = get_store()
     ledger = store.load_ledger()
@@ -1085,7 +1085,7 @@ def cmd_verify_chain(check_txs: bool = False):
         print('  Nothing committed yet.')
         return
 
-    print(f'  Verifying {len(ledger)} commit(s) against Bitcoin mainnet...\n')
+    print(f'  Verifying {len(ledger)} commit(s) against Bitcoin...\n')
     all_ok = True
     for i, entry in enumerate(ledger):
         height = entry.get('block_height')
@@ -1094,7 +1094,19 @@ def cmd_verify_chain(check_txs: bool = False):
         recorded_commitment = entry.get('commitment')
         ts = entry.get('ts', '?')
 
-        real_hash = fetch(f'{API_MAIN}/block-height/{height}') if height else None
+        # Older entries predate the mainnet-only convention and carry no
+        # `network` field — try mainnet first, then testnet, and report
+        # whichever chain the recorded hash actually belongs to.
+        real_hash = net_label = api = None
+        if height:
+            for label, candidate_api in (('mainnet', API_MAIN), ('testnet', API_TEST)):
+                candidate = fetch(f'{candidate_api}/block-height/{height}')
+                if candidate == recorded_hash:
+                    real_hash, net_label, api = candidate, label, candidate_api
+                    break
+                if candidate is not None and real_hash is None:
+                    real_hash, net_label, api = candidate, label, candidate_api  # best-effort fallback for the mismatch message
+
         hash_ok = real_hash is not None and real_hash == recorded_hash
         recomputed = (
             hashlib.sha256((recorded_hash + recorded_root).encode()).hexdigest()
@@ -1103,19 +1115,20 @@ def cmd_verify_chain(check_txs: bool = False):
         commitment_ok = recomputed is not None and recomputed == recorded_commitment
         ok = hash_ok and commitment_ok
 
-        print(f'  {"✅" if ok else "✗"} [{i}] block {height}  {ts}')
+        net_suffix = f'  [{net_label}]' if net_label else ''
+        print(f'  {"✅" if ok else "✗"} [{i}] block {height}{net_suffix}  {ts}')
         if not hash_ok:
             if real_hash is None:
-                print(f'      ✗ could not fetch block {height} from Bitcoin (offline, or height not yet mined)')
+                print(f'      ✗ could not fetch block {height} from Bitcoin, mainnet or testnet (offline, or height not yet mined)')
             else:
-                print('      ✗ recorded block_hash does not match the real chain')
+                print(f'      ✗ recorded block_hash does not match the real chain ({net_label} closest guess)')
                 print(f'        recorded: {recorded_hash}')
                 print(f'        actual:   {real_hash}')
         if not commitment_ok:
             got = f'{recomputed[:16]}…' if recomputed else '?'
             print(f'      ✗ commitment mismatch (recorded {recorded_commitment[:16]}…, recomputed {got})')
         if check_txs and hash_ok:
-            found, detail = check_op_return(recorded_hash, recorded_commitment, API_MAIN)
+            found, detail = check_op_return(recorded_hash, recorded_commitment, api)
             print(f'      {"✅ OP_RETURN found in tx " + detail if found else "⚠️  OP_RETURN not found (" + detail + ") — may not have been broadcast"}')
 
         all_ok = all_ok and ok
