@@ -964,10 +964,19 @@ def _resolve_entry(entries: list[dict], ref: str, type_filter: str | None = None
     """
     pool = entries if type_filter is None else [e for e in entries if e.get('type') == type_filter]
 
-    if len(ref) >= 6:
+    # 4 chars matches the short hash shown by ls/list/mv (sha256[:8]) — same
+    # abbreviation-length convention as git. A non-hex ref simply can't match
+    # any sha256 prefix, so this doesn't risk colliding with real names.
+    if len(ref) >= 4:
         hash_matches = [e for e in pool if e['sha256'].startswith(ref)]
         if len(hash_matches) == 1:
             return hash_matches[0], None
+        if len(hash_matches) > 1:
+            lines = '\n'.join(
+                f'    {e.get("orig_path", e["name"])}  ({e["sha256"][:12]}…)' for e in hash_matches
+            )
+            return None, (f'  ✗ hash "{ref}" is ambiguous — matches {len(hash_matches)} files:\n{lines}\n'
+                           f'  Use more characters to disambiguate.')
 
     path_matches = [e for e in pool if e.get('orig_path') == ref]
     if len(path_matches) == 1:
@@ -1239,15 +1248,20 @@ def cmd_mv(name_or_hash: str, new_path: str):
         print(f'  ✗ {name_or_hash} not in archive')
         return
 
+    short = entry['sha256'][:8]
     abs_new = os.path.abspath(new_path)
+    if os.path.isdir(abs_new):
+        # Real-mv semantics: moving into an existing directory keeps the
+        # current filename instead of renaming to the directory's name.
+        abs_new = os.path.join(abs_new, entry['name'])
     updates: dict = {'last_path': abs_new}
     new_name = os.path.basename(abs_new)
     if new_name != entry['name']:
         updates['name'] = new_name
-        print(f'  Renaming {entry["name"]} → {new_name}')
+        print(f'  Renaming {entry["name"]} → {new_name}  ({short}…)')
 
     store.update_entry(entry['sha256'], updates)
-    print(f'  ✅ {entry["name"]} → {abs_new}')
+    print(f'  ✅ {entry["name"]} → {abs_new}  ({short}…)')
 
 
 def cmd_restore(name_or_hash: str, dest: str):
