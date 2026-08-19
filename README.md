@@ -35,8 +35,9 @@ The resulting ledger is independently verifiable: anyone with the block hashes (
 | `broadcast.py` | Optional OP_RETURN broadcast via the `bit` library |
 | `main.py` | Orchestrator — runs clock loop, executes VM(s), writes ledger |
 | `verify.py` | Verifies ledger, VDF chain, trace, and fleet Merkle against Bitcoin |
-| `ott.py` | Bitcoin-anchored media archive — images and chunked video |
+| `ott.py` | Bitcoin-anchored media archive — images, video, and git repos; also an interactive shell |
 | `test_vm.py` | Unit tests (VM, VDF, trace, fleet) |
+| `test_ott_completion.py` | Unit tests (ott shell tab completion, path handling) |
 | `Makefile` | Common tasks: install, test, lint, run, ott |
 | `completions/` | Bash and Zsh tab completions for `btcvm` and `ott` |
 
@@ -143,6 +144,32 @@ python3 ott.py verify photo.jpg
 # Prove a specific 256 KB chunk of a video is in the archive
 python3 ott.py verify-chunk video.mp4 3
 ```
+
+**Interactive shell:**
+
+```bash
+python3 ott.py            # or: python3 ott.py shell
+```
+
+The shell wraps the same archive with a stateful `cd`-able hierarchy, tab
+completion on every command (archive names, tags, local paths), and a few
+things the flat CLI doesn't have:
+
+| Command | Description |
+|---|---|
+| `l [-a] [-t tag] [-b] [dir]` | One-level `ls`-style view of the archive hierarchy (from `orig_path`) |
+| `tree [-a] [-t tag] [-dN] [-b] [dir]` | Recursive tree view; `-d0` for unlimited depth |
+| `cd`, `pwd` | Navigate the *archive* hierarchy (real filesystem nav is `lcd`/`lpwd`) |
+| `list` / `ls [pattern]` | Full flat dump of every path in one table, optionally filtered by regex (bare or `/slash-delimited/`) |
+| `mv <name> <new_path>` | Update an entry's tracked path; moves into an existing dir like real `mv` |
+| `reindex [root]` | One indexed filesystem scan — relocates every stale entry and re-anchors `orig_path` to the archive root |
+| `tag <add\|rm\|list> <pattern> <tagname>` | Bulk-tag entries by regex match against their archive path |
+| `repo <add\|list\|verify\|update\|tag\|verify-tag\|qr>` | Track a git repo's HEAD and (optionally) a GPG-signed release tag in the archive |
+| `qr [hash\|file]` | QR code for a hash, a file's SHA256, or the current Merkle root |
+| `!<cmd>` | Run a real shell command without leaving the shell |
+
+Entries missing at their last known path are hidden by default in `l`/`tree`
+(`-a` shows them); `ott reindex` is the real fix.
 
 **Via Makefile:**
 
@@ -307,6 +334,11 @@ make ott-status   show archive status
 make ott-list     list archived files
 make ott-commit   commit Merkle root
 make ott-clean    remove manifest + ledger
+make ott-repo-add                 update archived repo record to HEAD
+make ott-tag [OTT_NEXT_TAG=v1.x]  sign a git tag + record fingerprint in ott
+make ott-push [OTT_NEXT_TAG=v1.x] push commits + tag, then commit ott root
+make ott-snapshot                 repo-add + commit root (no tag, no push)
+make ott-release [OTT_NEXT_TAG=v1.x] full: tag → push → commit root
 make add FILE=…     add file to ott
 make verify-file FILE=…  verify inclusion
 make completion     install shell completions
@@ -326,7 +358,7 @@ make completion     install shell completions
 ```bash
 make test
 # or
-python3 -m pytest test_vm.py -v
+python3 -m pytest -v
 ```
 
 ## License

@@ -67,7 +67,7 @@ completion:
 # ── Tests + lint ──────────────────────────────────────────────────────────────
 
 test:
-	$(PYTHON) -m pytest test_vm.py -v
+	$(PYTHON) -m pytest -v
 
 lint:
 	ruff check .

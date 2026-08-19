@@ -1068,6 +1068,62 @@ def cmd_verify(path_or_name: str):
             print('  On-chain:    ⚠️  root not yet committed')
 
 
+def cmd_verify_chain(check_txs: bool = False):
+    """Verify every ott ledger commit against real Bitcoin — refetches the
+    actual block hash at each recorded height and recomputes the commitment,
+    confirming what's on disk matches what's actually on-chain (not just
+    internally self-consistent, which is all `ott verify`/`ott status`
+    check). Note: ott's commitment formula is SHA256(block_hash + root)
+    (no separator) — different from btcvm's own verify.py, which uses
+    SHA256(f"{block_hash}:{root}"). Don't point verify.py at an ott ledger;
+    the commitments won't recompute correctly."""
+    from verify import API_MAIN, check_op_return, fetch
+
+    store = get_store()
+    ledger = store.load_ledger()
+    if not ledger:
+        print('  Nothing committed yet.')
+        return
+
+    print(f'  Verifying {len(ledger)} commit(s) against Bitcoin mainnet...\n')
+    all_ok = True
+    for i, entry in enumerate(ledger):
+        height = entry.get('block_height')
+        recorded_hash = entry.get('block_hash')
+        recorded_root = entry.get('merkle_root')
+        recorded_commitment = entry.get('commitment')
+        ts = entry.get('ts', '?')
+
+        real_hash = fetch(f'{API_MAIN}/block-height/{height}') if height else None
+        hash_ok = real_hash is not None and real_hash == recorded_hash
+        recomputed = (
+            hashlib.sha256((recorded_hash + recorded_root).encode()).hexdigest()
+            if recorded_hash and recorded_root else None
+        )
+        commitment_ok = recomputed is not None and recomputed == recorded_commitment
+        ok = hash_ok and commitment_ok
+
+        print(f'  {"✅" if ok else "✗"} [{i}] block {height}  {ts}')
+        if not hash_ok:
+            if real_hash is None:
+                print(f'      ✗ could not fetch block {height} from Bitcoin (offline, or height not yet mined)')
+            else:
+                print('      ✗ recorded block_hash does not match the real chain')
+                print(f'        recorded: {recorded_hash}')
+                print(f'        actual:   {real_hash}')
+        if not commitment_ok:
+            got = f'{recomputed[:16]}…' if recomputed else '?'
+            print(f'      ✗ commitment mismatch (recorded {recorded_commitment[:16]}…, recomputed {got})')
+        if check_txs and hash_ok:
+            found, detail = check_op_return(recorded_hash, recorded_commitment, API_MAIN)
+            print(f'      {"✅ OP_RETURN found in tx " + detail if found else "⚠️  OP_RETURN not found (" + detail + ") — may not have been broadcast"}')
+
+        all_ok = all_ok and ok
+
+    print()
+    print('  ✅ All commits verified against Bitcoin.' if all_ok else '  ✗ One or more commits failed verification.')
+
+
 def cmd_verify_chunk(path_or_name: str, chunk_idx: int):
     store = get_store()
     entries = store.load_manifest()
@@ -2082,6 +2138,15 @@ class OttShell(cmd.Cmd):
             return
         _run(cmd_verify, parts[0])
 
+    def do_verify_chain(self, arg):
+        """verify_chain [--check-txs]  — Verify every ledger commit against
+        real Bitcoin (refetches each recorded block's actual hash and
+        recomputes the commitment). --check-txs also confirms the OP_RETURN
+        is present (slower, one extra fetch per commit)."""
+        parts = shlex.split(arg)
+        check_txs = any(p in ('--check-txs', '-c') for p in parts)
+        _run(cmd_verify_chain, check_txs)
+
     def do_verify_chunk(self, arg):
         """verify_chunk <file> <chunk>  — Byte-range inclusion proof for a video chunk."""
         parts = shlex.split(arg)
@@ -2355,6 +2420,10 @@ def main():
     p_verify = sub.add_parser('verify', help='Merkle inclusion proof for a file')
     p_verify.add_argument('path')
 
+    p_vch = sub.add_parser('verify-chain', help='Verify every ledger commit against real Bitcoin')
+    p_vch.add_argument('-c', '--check-txs', action='store_true',
+                       help='Also confirm the OP_RETURN is present in each block (slower)')
+
     p_vc = sub.add_parser('verify-chunk', help='Byte-range inclusion proof for a video chunk')
     p_vc.add_argument('path')
     p_vc.add_argument('chunk', type=int)
@@ -2412,6 +2481,8 @@ def main():
             cmd_commit()
         elif args.cmd == 'verify':
             cmd_verify(args.path)
+        elif args.cmd == 'verify-chain':
+            cmd_verify_chain(args.check_txs)
         elif args.cmd == 'verify-chunk':
             cmd_verify_chunk(args.path, args.chunk)
         elif args.cmd == 'find':
