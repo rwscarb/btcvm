@@ -296,6 +296,23 @@ class OttStore:
         with open(self.ledger_path, 'a') as f:
             f.write(json.dumps(entry) + '\n')
 
+    def update_ledger_entry(self, commitment: str, updates: dict) -> bool:
+        """Patch the ledger entry matching `commitment` in place (e.g. to
+        record a tx_hash after broadcasting). Ledger is append-only in the
+        common case; this is the one exception, done by rewriting the whole
+        (small) file. Returns True if a matching entry was found."""
+        entries = self.load_ledger()
+        found = False
+        for e in entries:
+            if e.get('commitment') == commitment:
+                e.update(updates)
+                found = True
+        if found:
+            with open(self.ledger_path, 'w') as f:
+                for e in entries:
+                    f.write(json.dumps(e) + '\n')
+        return found
+
     def current_root(self) -> str:
         return merkle_root([e['sha256'] for e in self.load_manifest()])
 
@@ -516,15 +533,25 @@ def cmd_status():
 
 def _print_root_tx(entry: dict):
     """Look up the on-chain OP_RETURN tx for a committed ledger entry and
-    print a link + QR code to view it. No tx_hash is persisted anywhere —
-    `ott commit` and `broadcast.py` are separate manual steps and the
-    broadcast's return value is never saved back — so this always does a
-    live lookup rather than reading a stored field."""
+    print a link + QR code to view it. `ott broadcast` records tx_hash back
+    onto the ledger entry, so check that first and skip the live lookup
+    entirely when it's already known — older entries broadcast before that
+    existed (or via the standalone `broadcast` module directly) won't have
+    it, so this still falls back to a live check_op_return lookup."""
+    commitment = entry.get('commitment')
+    if entry.get('tx_hash'):
+        network = entry.get('network', 'mainnet')
+        explorer = 'https://blockstream.info/tx/' if network == 'mainnet' else 'https://blockstream.info/testnet/tx/'
+        url = explorer + entry['tx_hash']
+        print(f'  On-chain tx: {entry["tx_hash"]}  [{network}]')
+        print(f'  {url}')
+        cmd_qr(url, label='view transaction')
+        return
+
     from verify import API_MAIN, API_TEST, check_op_return, fetch
 
     height = entry.get('block_height')
     block_hash = entry.get('block_hash')
-    commitment = entry.get('commitment')
     if not (height and block_hash and commitment):
         return
 
@@ -548,7 +575,7 @@ def _print_root_tx(entry: dict):
         cmd_qr(url, label='view transaction')
     else:
         print(f'  On-chain tx: not found ({detail}) — may not be broadcast yet')
-        print(f'    To broadcast: python broadcast.py {commitment}')
+        print(f'    To broadcast: ott broadcast --wif <WIF_KEY> [--network mainnet]  (commitment {commitment[:16]}…)')
 
 
 def _breadcrumb_paths(entries: list[dict]) -> tuple[str, dict[str, str]]:
@@ -998,9 +1025,65 @@ def cmd_commit():
     print(f'  Ledger:      {store.ledger_path}')
     print()
     print('  To anchor on-chain:')
-    print(f'    python broadcast.py {commitment}')
+    print('    ott broadcast --wif <WIF_KEY> [--network mainnet]')
     print()
     cmd_qr(commitment, label='commitment QR')
+
+
+def cmd_broadcast(commitment: str | None, wif: str, network: str = 'testnet'):
+    """Broadcast a commitment as a Bitcoin OP_RETURN tx. Defaults to the
+    most recent ott commit's commitment if none is given explicitly.
+    `broadcast.py` has no CLI of its own — it's a plain importable module,
+    not a runnable script (no __main__ block) — this is the actual entry
+    point; running `python broadcast.py <commitment>` does nothing but
+    import it and exit, which is exactly the confusing silent no-op this
+    replaces. Records the resulting tx_hash back onto the matching ledger
+    entry so `ott status` doesn't have to re-derive it via a live lookup
+    every time."""
+    from broadcast import broadcast_commitment, check_available, get_balance
+
+    store = get_store()
+    ledger = store.load_ledger()
+    if not commitment:
+        if not ledger:
+            print('  ✗ Nothing committed yet — run `ott commit` first, or pass a commitment explicitly.')
+            return
+        last = ledger[-1]
+        commitment = last['commitment']
+        print(f'  Using most recent commit: {commitment}')
+        if last.get('merkle_root') != store.current_root():
+            print('  ⚠️  Note: the archive has changed since that commit — run `ott commit` again if you want to anchor the current state instead.')
+
+    try:
+        check_available()
+    except RuntimeError as e:
+        print(f'  ✗ {e}')
+        return
+
+    try:
+        balance = get_balance(wif, network)
+    except Exception as e:
+        print(f'  ✗ Could not check wallet balance: {e}')
+        return
+    print(f'  Wallet balance: {balance:,} sats  ({network})')
+    if balance < 1000:
+        print('  ⚠️  Balance looks too low to cover an OP_RETURN tx + fee — this will likely fail.')
+
+    print('  Broadcasting…')
+    try:
+        tx_hash = broadcast_commitment(commitment, wif, network)
+    except Exception as e:
+        print(f'  ✗ Broadcast failed: {e}')
+        return
+
+    print(f'  ✅ Broadcast: {tx_hash}')
+    explorer = 'https://blockstream.info/tx/' if network == 'mainnet' else 'https://blockstream.info/testnet/tx/'
+    url = explorer + tx_hash
+    print(f'  {url}')
+    cmd_qr(url, label='view transaction')
+
+    if store.update_ledger_entry(commitment, {'tx_hash': tx_hash}):
+        print('  Recorded tx_hash on the matching ledger entry.')
 
 
 def _resolve_entry(entries: list[dict], ref: str, type_filter: str | None = None):
@@ -2193,6 +2276,31 @@ class OttShell(cmd.Cmd):
         """commit  — Commit Merkle root to btcvm ledger."""
         _run(cmd_commit)
 
+    def do_broadcast(self, arg):
+        """broadcast [commitment] --wif <WIF_KEY> [--network testnet|mainnet]
+        — Broadcast a commitment as a Bitcoin OP_RETURN tx. Defaults to the
+        most recent `ott commit`'s commitment if none is given. Network
+        defaults to testnet — pass --network mainnet for real BTC."""
+        parts = shlex.split(arg)
+        wif = None
+        network = 'testnet'
+        rest = []
+        i = 0
+        while i < len(parts):
+            if parts[i] == '--wif' and i + 1 < len(parts):
+                i += 1
+                wif = parts[i]
+            elif parts[i] == '--network' and i + 1 < len(parts):
+                i += 1
+                network = parts[i]
+            else:
+                rest.append(parts[i])
+            i += 1
+        if not wif:
+            print('  Usage: broadcast [commitment] --wif <WIF_KEY> [--network testnet|mainnet]')
+            return
+        _run(cmd_broadcast, rest[0] if rest else None, wif, network)
+
     def do_verify(self, arg):
         """verify <file>  — Merkle inclusion proof for a file."""
         parts = shlex.split(arg)
@@ -2483,6 +2591,12 @@ def main():
     sub.add_parser('commit', help='Commit Merkle root to btcvm ledger')
     sub.add_parser('shell',  help='Start interactive shell')
 
+    p_bc = sub.add_parser('broadcast', help='Broadcast a commitment as a Bitcoin OP_RETURN tx')
+    p_bc.add_argument('commitment', nargs='?', default=None,
+                      help='Defaults to the most recent ott commit')
+    p_bc.add_argument('--wif', required=True, help='Wallet WIF private key')
+    p_bc.add_argument('--network', default='testnet', choices=['testnet', 'mainnet'])
+
     p_verify = sub.add_parser('verify', help='Merkle inclusion proof for a file')
     p_verify.add_argument('path')
 
@@ -2545,6 +2659,8 @@ def main():
             cmd_tag(args.subcmd, args.args)
         elif args.cmd == 'commit':
             cmd_commit()
+        elif args.cmd == 'broadcast':
+            cmd_broadcast(args.commitment, args.wif, args.network)
         elif args.cmd == 'verify':
             cmd_verify(args.path)
         elif args.cmd == 'verify-chain':
