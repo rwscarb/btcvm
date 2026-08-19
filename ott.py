@@ -252,11 +252,23 @@ class OttStore:
                             by_repo_name[e['name']] = sha
                     except (json.JSONDecodeError, KeyError):
                         pass
-        return list(by_hash.values())
+        return [e for e in by_hash.values() if not e.get('deleted')]
 
     def save_entry(self, entry: dict):
         with open(self.manifest_path, 'a') as f:
             f.write(json.dumps(entry) + '\n')
+
+    def delete_entry(self, sha256: str):
+        """Tombstone an entry — appends a {'deleted': True} record rather
+        than rewriting the file, keeping the manifest's append-only audit
+        trail intact (the old record is still there in the raw file, just
+        filtered out of load_manifest's output by last-write-wins). Does
+        NOT remove the object-store copy — deleting archived bytes isn't
+        what this is for; that's a separate, much bigger decision than
+        rm was ever meant to make. Only ever called when nothing has been
+        committed to Bitcoin yet (see cmd_rm) — once committed, entries
+        are permanent, by design."""
+        self.save_entry({'sha256': sha256, 'deleted': True})
 
     def update_entry(self, sha256: str, updates: dict):
         """Append an updated version of an entry (last-write-wins on load)."""
@@ -550,41 +562,66 @@ def cmd_add(paths: list[str], recursive: bool = False):
 
 
 def cmd_rm(name_or_hash: str, cwd: str = '', regex: bool = False):
-    """Unstage a pending `add` — only touches files the archive hasn't
-    committed yet. Once something's in the manifest (let alone anchored to
-    Bitcoin), rm can't remove it; that's intentional, not a limitation to
-    work around. With regex=True, name_or_hash is a bulk pattern instead of
-    a single name/hash — bare or /slash-delimited/, same convention as
-    `tag`, matched against orig_path across every staged entry."""
+    """Remove something the blockchain hasn't seen yet. Staged (never-
+    archived) entries are always fair game. Manifest entries (already
+    archived) are too, but only when the ledger has no commits at all —
+    nothing anchored to Bitcoin means nothing here is permanent yet. The
+    moment even one commit exists, rm goes back to staged-only: figuring
+    out which *specific* entries were or weren't covered by a past commit
+    is a real provenance question, not one worth guessing at — once
+    anything's committed, the whole manifest is treated as settled.
+    Manifest removal tombstones the entry (load_manifest filters it out)
+    without touching its object-store copy — rm was never meant to be the
+    thing that deletes archived bytes.
+    With regex=True, name_or_hash is a bulk pattern instead of a single
+    name/hash — bare or /slash-delimited/, same convention as `tag`."""
     store = get_store()
     staged = store.load_staged()
+    manifest_removable = not store.load_ledger()  # nothing ever committed
 
     if regex:
         matched = _matching_entries(staged, name_or_hash)
-        if not matched:
-            print(f'  ✗ no staged entries match {name_or_hash!r}')
-            return
         for e in matched:
             store.unstage_entry(e['sha256'])
-        print(f'  Unstaged {len(matched)} entr{"y" if len(matched) == 1 else "ies"}:')
+        removed_manifest = []
+        if manifest_removable:
+            removed_manifest = _matching_entries(store.load_manifest(), name_or_hash)
+            for e in removed_manifest:
+                store.delete_entry(e['sha256'])
+        total = matched + removed_manifest
+        if not total:
+            hint = '' if manifest_removable else ' (archive has committed entries — only staged files are rm-able)'
+            print(f'  ✗ nothing matches {name_or_hash!r}{hint}')
+            return
+        print(f'  Removed {len(total)} entr{"y" if len(total) == 1 else "ies"}:')
         for e in matched:
-            print(f'    - {e.get("orig_path", e["name"])}  ({e["sha256"][:12]}…)')
+            print(f'    - {e.get("orig_path", e["name"])}  ({e["sha256"][:12]}…)  [staged]')
+        for e in removed_manifest:
+            print(f'    - {e.get("orig_path", e["name"])}  ({e["sha256"][:12]}…)  [archived, never committed]')
         return
 
     entry, err = _resolve_entry(staged, name_or_hash, cwd=cwd)
     if err:
         print(err)
         return
-    if entry is None:
-        manifest_entry, _ = _resolve_entry(store.load_manifest(), name_or_hash, cwd=cwd)
-        if manifest_entry is not None:
-            print(f'  ✗ {name_or_hash} is already committed — rm only unstages files that haven\'t been archived yet')
-        else:
-            print(f'  ✗ {name_or_hash} not staged')
+    if entry is not None:
+        store.unstage_entry(entry['sha256'])
+        print(f'  Unstaged {entry["name"]}  ({entry["sha256"][:12]}…)')
         return
 
-    store.unstage_entry(entry['sha256'])
-    print(f'  Unstaged {entry["name"]}  ({entry["sha256"][:12]}…)')
+    manifest_entry, err = _resolve_entry(store.load_manifest(), name_or_hash, cwd=cwd)
+    if err:
+        print(err)
+        return
+    if manifest_entry is None:
+        print(f'  ✗ {name_or_hash} not staged')
+        return
+    if not manifest_removable:
+        print(f'  ✗ {name_or_hash} is already committed — rm only removes files the blockchain hasn\'t seen, '
+              f'and this archive has committed entries')
+        return
+    store.delete_entry(manifest_entry['sha256'])
+    print(f'  Removed {manifest_entry["name"]}  ({manifest_entry["sha256"][:12]}…)  [archived, never committed]')
 
 
 def cmd_status():
@@ -2335,11 +2372,13 @@ class OttShell(cmd.Cmd):
         _run(cmd_add, paths, recursive)
 
     def do_rm(self, arg):
-        """rm [-r] <name_or_hash_or_pattern>  — Unstage a pending add. Only
-        touches files that haven't been committed yet — once archived, rm
-        can't remove them. -r/--regex treats the argument as a bulk regex
-        pattern (bare or /slash-delimited/, same as `tag`) instead of a
-        single name/hash, matched against every staged entry's path."""
+        """rm [-r] <name_or_hash_or_pattern>  — Remove something the
+        blockchain hasn't seen yet: staged files always, archived
+        (manifest) entries too but only if nothing's ever been committed
+        to Bitcoin — once a single commit exists, only staged files stay
+        rm-able. -r/--regex treats the argument as a bulk regex pattern
+        (bare or /slash-delimited/, same as `tag`) instead of a single
+        name/hash."""
         parts = shlex.split(arg)
         regex = False
         rest = []
@@ -2834,7 +2873,7 @@ def main():
     p_add.add_argument('-r', '--recursive', action='store_true',
                         help='Recurse into directories (skips .ott/.git)')
 
-    p_rm = sub.add_parser('rm', help='Unstage a pending add (not yet committed)')
+    p_rm = sub.add_parser('rm', help="Remove staged files; also archived ones if nothing's ever been committed")
     p_rm.add_argument('name')
     p_rm.add_argument('-r', '--regex', action='store_true',
                       help='Treat name as a bulk regex pattern instead of a single name/hash')
