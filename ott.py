@@ -165,6 +165,7 @@ class OttStore:
         self.dir           = ott_dir
         self.root_dir      = os.path.dirname(ott_dir)
         self.manifest_path = os.path.join(ott_dir, 'manifest.jsonl')
+        self.staged_path   = os.path.join(ott_dir, 'staged.jsonl')
         self.ledger_path   = os.path.join(ott_dir, 'ledger.jsonl')
         self.config_path   = os.path.join(ott_dir, 'config')
         self.chunks_dir    = os.path.join(ott_dir, 'chunks')
@@ -277,6 +278,48 @@ class OttStore:
         os.makedirs(self.chunks_dir, exist_ok=True)
         with open(os.path.join(self.chunks_dir, f'{file_hash}.json'), 'w') as f:
             json.dump(chunks, f)
+
+    def load_staged(self) -> list[dict]:
+        """Entries `add` has staged but not yet synced into the manifest —
+        the git-index equivalent. Unlike the manifest, staging is small and
+        freely mutable, so this is a plain list (each sha256 appears once),
+        not an append-only last-write-wins log."""
+        if not os.path.exists(self.staged_path):
+            return []
+        out = []
+        with open(self.staged_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        out.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+        return out
+
+    def _write_staged(self, entries: list[dict]):
+        with open(self.staged_path, 'w') as f:
+            for e in entries:
+                f.write(json.dumps(e) + '\n')
+
+    def stage_entry(self, entry: dict):
+        """Add (or replace, if already staged) one entry in the staging area."""
+        staged = [e for e in self.load_staged() if e['sha256'] != entry['sha256']]
+        staged.append(entry)
+        self._write_staged(staged)
+
+    def unstage_entry(self, sha256: str) -> bool:
+        """Remove one entry from staging. Returns False if it wasn't staged."""
+        staged = self.load_staged()
+        kept = [e for e in staged if e['sha256'] != sha256]
+        if len(kept) == len(staged):
+            return False
+        self._write_staged(kept)
+        return True
+
+    def clear_staged(self):
+        if os.path.exists(self.staged_path):
+            os.remove(self.staged_path)
 
     def load_ledger(self) -> list[dict]:
         if not os.path.exists(self.ledger_path):
@@ -421,10 +464,17 @@ def _walk_files(root: str) -> list[str]:
 
 
 def cmd_add(paths: list[str], recursive: bool = False):
+    """Stage files for the archive — git-index style. Hashing (and, for
+    video, chunking) happens now, since that's what identifies the file and
+    catches duplicates, but nothing is copied into object storage or
+    written to the manifest until `ott commit`/`ott sync`. `ott rm` can
+    freely drop a staged file before that; once committed, it's permanent
+    the way the rest of ott always has been."""
     store = get_store()
     existing = {e['sha256'] for e in store.load_manifest()}
+    staged_hashes = {e['sha256'] for e in store.load_staged()}
     chunk_size = store.chunk_size
-    added = 0
+    staged_now = 0
 
     expanded = []
     for path in paths:
@@ -464,6 +514,9 @@ def cmd_add(paths: list[str], recursive: bool = False):
         if digest in existing:
             print(f'  = already archived: {os.path.basename(path)} ({digest[:12]}…)')
             continue
+        if digest in staged_hashes:
+            print(f'  = already staged: {os.path.basename(path)} ({digest[:12]}…)')
+            continue
 
         entry = {
             'sha256':     digest,
@@ -481,30 +534,57 @@ def cmd_add(paths: list[str], recursive: bool = False):
             'n_chunks':   n_chunks,
             'chunk_size': chunk_size if video else None,
         }
-        store.save_entry(entry)
         if video and chunks:
-            store.save_chunks(digest, chunks)
-        try:
-            store.put_object(digest, path)
-        except OSError as e:
-            print(f'  ⚠️  Could not store an archive copy of {os.path.basename(path)}: {e}')
-        existing.add(digest)
-        added += 1
+            entry['_chunks'] = chunks  # carried through to commit/sync, stripped before it hits the manifest
+        store.stage_entry(entry)
+        staged_hashes.add(digest)
+        staged_now += 1
         tag = f'  [{n_chunks} chunks × {chunk_size // 1024}KB]' if video else ''
-        print(f'  + {os.path.basename(path)}  {digest[:16]}…  ({size:,} bytes){tag}')
+        print(f'  + {os.path.basename(path)}  {digest[:16]}…  ({size:,} bytes){tag}  [staged]')
 
-    if added:
-        root = store.current_root()
-        print(f'\n  Merkle root: {root}')
-        print(f'  Archive: {len(store.load_manifest())} file(s) total  (.ott/ at {store.dir})')
+    if staged_now:
+        n_total_staged = len(store.load_staged())
+        print(f'\n  Staged: {n_total_staged} file(s) total — run `ott commit` (or `ott sync`) to archive them')
     else:
-        print('  No new files added.')
+        print('  No new files staged.')
+
+
+def cmd_rm(name_or_hash: str, cwd: str = ''):
+    """Unstage a pending `add` — only touches files the archive hasn't
+    committed yet. Once something's in the manifest (let alone anchored to
+    Bitcoin), rm can't remove it; that's intentional, not a limitation to
+    work around."""
+    store = get_store()
+    staged = store.load_staged()
+
+    entry, err = _resolve_entry(staged, name_or_hash, cwd=cwd)
+    if err:
+        print(err)
+        return
+    if entry is None:
+        manifest_entry, _ = _resolve_entry(store.load_manifest(), name_or_hash, cwd=cwd)
+        if manifest_entry is not None:
+            print(f'  ✗ {name_or_hash} is already committed — rm only unstages files that haven\'t been archived yet')
+        else:
+            print(f'  ✗ {name_or_hash} not staged')
+        return
+
+    store.unstage_entry(entry['sha256'])
+    print(f'  Unstaged {entry["name"]}  ({entry["sha256"][:12]}…)')
 
 
 def cmd_status():
     store = get_store()
     entries = store.load_manifest()
     print(f'  Archive:     {store.dir}')
+
+    staged = store.load_staged()
+    if staged:
+        print(f'\n  Staged ({len(staged)}) — not yet archived:')
+        for e in staged:
+            print(f'    + {e.get("orig_path", e["name"])}  ({e["sha256"][:12]}…)')
+        print('  Run `ott commit` (or `ott sync`) to archive, or `ott rm <name>` to drop one.\n')
+
     if not entries:
         print('  Empty — no files archived yet.')
         return
@@ -985,8 +1065,42 @@ def cmd_tag(subcmd: str, args: list[str]):
         raise OttError(f'unknown tag subcommand: {subcmd!r}  (add, rm, list)')
 
 
+def _absorb_staged(store: 'OttStore'):
+    """Copy every staged entry into object storage and the real manifest —
+    the actual archiving work `add` used to do immediately, now deferred
+    to commit/sync time. A staged file whose source has since moved or
+    vanished is skipped (with a warning) and left staged rather than
+    silently dropped, so nothing gets lost without an explicit `rm`."""
+    staged = store.load_staged()
+    if not staged:
+        return
+    remaining = []
+    absorbed = 0
+    for entry in staged:
+        src = entry.get('last_path', '')
+        if not os.path.isfile(src):
+            print(f'  ⚠️  {entry["name"]} not found at {src} — still staged; '
+                  f'`ott find` to relocate it or `ott rm` to drop it')
+            remaining.append(entry)
+            continue
+        chunks = entry.pop('_chunks', None)
+        try:
+            store.put_object(entry['sha256'], src)
+        except OSError as e:
+            print(f'  ⚠️  Could not store an archive copy of {entry["name"]}: {e}')
+        if chunks:
+            store.save_chunks(entry['sha256'], chunks)
+        store.save_entry(entry)
+        absorbed += 1
+        print(f'  + {entry["name"]}  {entry["sha256"][:16]}…  (archived)')
+    store._write_staged(remaining)
+    if absorbed:
+        print(f'  Archived {absorbed} staged file(s).\n')
+
+
 def cmd_commit():
     store = get_store()
+    _absorb_staged(store)
     entries = store.load_manifest()
     if not entries:
         print('  Nothing to commit — archive is empty.')
@@ -2182,7 +2296,10 @@ class OttShell(cmd.Cmd):
         return self._files(text)
 
     def do_add(self, arg):
-        """add [-r] <file> [file ...]  — Add images or video (dirs need -r/--recursive)."""
+        """add [-r] <file> [file ...]  — Stage images or video for the
+        archive (dirs need -r/--recursive). Hashed now, but not copied into
+        object storage or written to the manifest until `commit`/`sync` —
+        `rm` can drop a staged file before then."""
         import glob
         tokens = shlex.split(arg)
         recursive = False
@@ -2202,6 +2319,22 @@ class OttShell(cmd.Cmd):
             else:
                 paths.append(expanded)  # let cmd_add report the missing file
         _run(cmd_add, paths, recursive)
+
+    def do_rm(self, arg):
+        """rm <name_or_hash>  — Unstage a pending add. Only touches files
+        that haven't been committed yet — once archived, rm can't remove
+        them."""
+        parts = shlex.split(arg)
+        if not parts:
+            print('  Usage: rm <name_or_hash>')
+            return
+        _run(cmd_rm, parts[0], self.archive_cwd)
+
+    def complete_rm(self, text, line, begidx, endidx):
+        try:
+            return [e['name'] for e in get_store().load_staged() if e['name'].startswith(text)]
+        except OttNotFoundError:
+            return []
 
     def do_status(self, _arg):
         """status  — Show archive status and current Merkle root."""
@@ -2361,7 +2494,12 @@ class OttShell(cmd.Cmd):
         return [out_prefix + n + '/' for n in dirs if n.startswith(tail)]
 
     def do_commit(self, _arg):
-        """commit  — Commit Merkle root to btcvm ledger."""
+        """commit  — Archive any staged files, then commit the Merkle root
+        to the btcvm ledger. (sync is an alias for this.)"""
+        _run(cmd_commit)
+
+    def do_sync(self, _arg):
+        """sync  — Alias for commit."""
         _run(cmd_commit)
 
     def do_broadcast(self, arg):
@@ -2668,10 +2806,13 @@ def main():
     p_init.add_argument('--migrate', action='store_true',
                         help='Import old ott_manifest.jsonl / imgfs_manifest.jsonl')
 
-    p_add = sub.add_parser('add', help='Add images or video to the archive')
+    p_add = sub.add_parser('add', help='Stage images or video for the archive')
     p_add.add_argument('paths', nargs='+')
     p_add.add_argument('-r', '--recursive', action='store_true',
                         help='Recurse into directories (skips .ott/.git)')
+
+    p_rm = sub.add_parser('rm', help='Unstage a pending add (not yet committed)')
+    p_rm.add_argument('name')
 
     sub.add_parser('status', help='Show archive status and Merkle root')
 
@@ -2703,7 +2844,8 @@ def main():
     p_tag.add_argument('subcmd', choices=['add', 'rm', 'list'], metavar='add|rm|list')
     p_tag.add_argument('args', nargs='*')
 
-    sub.add_parser('commit', help='Commit Merkle root to btcvm ledger')
+    sub.add_parser('commit', help='Archive staged files and commit the Merkle root to btcvm ledger')
+    sub.add_parser('sync',   help='Alias for commit')
     sub.add_parser('shell',  help='Start interactive shell')
 
     p_bc = sub.add_parser('broadcast', help='Broadcast a commitment as a Bitcoin OP_RETURN tx')
@@ -2768,6 +2910,8 @@ def main():
             cmd_init(args.path, args.migrate)
         elif args.cmd == 'add':
             cmd_add(args.paths, args.recursive)
+        elif args.cmd == 'rm':
+            cmd_rm(args.name)
         elif args.cmd == 'status':
             cmd_status()
         elif args.cmd == 'list':
@@ -2779,6 +2923,8 @@ def main():
         elif args.cmd == 'tag':
             cmd_tag(args.subcmd, args.args)
         elif args.cmd == 'commit':
+            cmd_commit()
+        elif args.cmd == 'sync':
             cmd_commit()
         elif args.cmd == 'broadcast':
             cmd_broadcast(args.commitment, args.wif, args.network)
