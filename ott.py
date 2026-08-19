@@ -561,15 +561,31 @@ def cmd_add(paths: list[str], recursive: bool = False):
         print('  No new files staged.')
 
 
+def _last_commit_ts(store: 'OttStore') -> str | None:
+    ledger = store.load_ledger()
+    return ledger[-1]['ts'] if ledger else None
+
+
+def _never_committed(entry: dict, last_commit_ts: str | None) -> bool:
+    """True if this entry could not possibly be covered by any past commit.
+    Ledger entries are chronological (append-only), so comparing against
+    the latest one is sufficient — if this entry was added after the most
+    recent commit, it was added after all of them. ISO8601 'Z' timestamps
+    compare correctly as plain strings. This is a timestamp heuristic, not
+    a cryptographic proof of non-inclusion (the old commitment formula
+    doesn't retain per-leaf membership) — fine for a personal archive
+    that isn't defending against a clock-tampering adversary, not fine as
+    a security boundary in a different threat model."""
+    return last_commit_ts is None or entry.get('added', '') > last_commit_ts
+
+
 def cmd_rm(name_or_hash: str, cwd: str = '', regex: bool = False):
     """Remove something the blockchain hasn't seen yet. Staged (never-
     archived) entries are always fair game. Manifest entries (already
-    archived) are too, but only when the ledger has no commits at all —
-    nothing anchored to Bitcoin means nothing here is permanent yet. The
-    moment even one commit exists, rm goes back to staged-only: figuring
-    out which *specific* entries were or weren't covered by a past commit
-    is a real provenance question, not one worth guessing at — once
-    anything's committed, the whole manifest is treated as settled.
+    archived) are too, but only the ones added after the archive's most
+    recent commit — those couldn't have been part of that commit's Merkle
+    root, so removing them doesn't touch anything actually anchored.
+    Entries older than the last commit stay permanent, by design.
     Manifest removal tombstones the entry (load_manifest filters it out)
     without touching its object-store copy — rm was never meant to be the
     thing that deletes archived bytes.
@@ -577,20 +593,20 @@ def cmd_rm(name_or_hash: str, cwd: str = '', regex: bool = False):
     name/hash — bare or /slash-delimited/, same convention as `tag`."""
     store = get_store()
     staged = store.load_staged()
-    manifest_removable = not store.load_ledger()  # nothing ever committed
+    last_commit_ts = _last_commit_ts(store)
 
     if regex:
         matched = _matching_entries(staged, name_or_hash)
         for e in matched:
             store.unstage_entry(e['sha256'])
-        removed_manifest = []
-        if manifest_removable:
-            removed_manifest = _matching_entries(store.load_manifest(), name_or_hash)
-            for e in removed_manifest:
-                store.delete_entry(e['sha256'])
+        manifest_matches = _matching_entries(store.load_manifest(), name_or_hash)
+        removed_manifest = [e for e in manifest_matches if _never_committed(e, last_commit_ts)]
+        skipped = len(manifest_matches) - len(removed_manifest)
+        for e in removed_manifest:
+            store.delete_entry(e['sha256'])
         total = matched + removed_manifest
         if not total:
-            hint = '' if manifest_removable else ' (archive has committed entries — only staged files are rm-able)'
+            hint = f' ({skipped} match{"es" if skipped != 1 else ""} committed, left alone)' if skipped else ''
             print(f'  ✗ nothing matches {name_or_hash!r}{hint}')
             return
         print(f'  Removed {len(total)} entr{"y" if len(total) == 1 else "ies"}:')
@@ -598,6 +614,8 @@ def cmd_rm(name_or_hash: str, cwd: str = '', regex: bool = False):
             print(f'    - {e.get("orig_path", e["name"])}  ({e["sha256"][:12]}…)  [staged]')
         for e in removed_manifest:
             print(f'    - {e.get("orig_path", e["name"])}  ({e["sha256"][:12]}…)  [archived, never committed]')
+        if skipped:
+            print(f'  ({skipped} other match{"es" if skipped != 1 else ""} already committed — left alone)')
         return
 
     entry, err = _resolve_entry(staged, name_or_hash, cwd=cwd)
@@ -616,9 +634,9 @@ def cmd_rm(name_or_hash: str, cwd: str = '', regex: bool = False):
     if manifest_entry is None:
         print(f'  ✗ {name_or_hash} not staged')
         return
-    if not manifest_removable:
-        print(f'  ✗ {name_or_hash} is already committed — rm only removes files the blockchain hasn\'t seen, '
-              f'and this archive has committed entries')
+    if not _never_committed(manifest_entry, last_commit_ts):
+        print(f'  ✗ {name_or_hash} was added before the archive\'s last commit ({last_commit_ts}) — '
+              f'it may be covered by an anchored Merkle root, so rm won\'t touch it')
         return
     store.delete_entry(manifest_entry['sha256'])
     print(f'  Removed {manifest_entry["name"]}  ({manifest_entry["sha256"][:12]}…)  [archived, never committed]')
@@ -2373,12 +2391,12 @@ class OttShell(cmd.Cmd):
 
     def do_rm(self, arg):
         """rm [-r] <name_or_hash_or_pattern>  — Remove something the
-        blockchain hasn't seen yet: staged files always, archived
-        (manifest) entries too but only if nothing's ever been committed
-        to Bitcoin — once a single commit exists, only staged files stay
-        rm-able. -r/--regex treats the argument as a bulk regex pattern
-        (bare or /slash-delimited/, same as `tag`) instead of a single
-        name/hash."""
+        blockchain hasn't seen yet: staged files always, plus archived
+        (manifest) entries added after the archive's most recent commit —
+        those can't be covered by that commit's Merkle root. Entries older
+        than the last commit are permanent. -r/--regex treats the argument
+        as a bulk regex pattern (bare or /slash-delimited/, same as `tag`)
+        instead of a single name/hash."""
         parts = shlex.split(arg)
         regex = False
         rest = []
@@ -2873,7 +2891,7 @@ def main():
     p_add.add_argument('-r', '--recursive', action='store_true',
                         help='Recurse into directories (skips .ott/.git)')
 
-    p_rm = sub.add_parser('rm', help="Remove staged files; also archived ones if nothing's ever been committed")
+    p_rm = sub.add_parser('rm', help='Remove staged files, or archived ones added since the last commit')
     p_rm.add_argument('name')
     p_rm.add_argument('-r', '--regex', action='store_true',
                       help='Treat name as a bulk regex pattern instead of a single name/hash')
