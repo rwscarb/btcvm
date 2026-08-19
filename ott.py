@@ -2684,7 +2684,7 @@ class OttShell(cmd.Cmd):
             subcmds = ['add', 'list', 'verify', 'update', 'tag', 'verify-tag', 'qr']
             return [s for s in subcmds if s.startswith(text)]
         if len(parts) == 2:  # completing path/name
-            if parts[1] in ('verify', 'v', 'update', 'up', 'qr'):
+            if parts[1] in ('verify', 'v', 'update', 'up', 'qr', 'tag', 't', 'verify-tag', 'vt'):
                 try:
                     names = [e['name'] for e in get_store().load_manifest()
                              if e.get('type') == 'repo']
@@ -2692,7 +2692,37 @@ class OttShell(cmd.Cmd):
                 except OttNotFoundError:
                     pass
             return self._files(text)
+        if len(parts) == 3 and parts[1] in ('tag', 't', 'verify-tag', 'vt'):
+            # Existing tags — useful both to see the naming pattern when
+            # creating a new one and, for verify-tag, to reference one
+            # that actually exists.
+            return self._git_tag_names(parts[2], text)
+        if len(parts) == 4 and parts[1] in ('tag', 't'):
+            return self._gpg_key_ids(text)
         return []
+
+    def _git_tag_names(self, repo_path_or_name: str, text: str) -> list[str]:
+        try:
+            abs_path = os.path.abspath(repo_path_or_name)
+            if not os.path.isdir(os.path.join(abs_path, '.git')):
+                return []
+            out = _git(abs_path, 'tag', '-l')
+            return [t for t in out.splitlines() if t.startswith(text)]
+        except (OttError, OSError):
+            return []
+
+    def _gpg_key_ids(self, text: str) -> list[str]:
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['gpg', '--list-secret-keys', '--keyid-format=long'],
+                capture_output=True, text=True,
+            )
+            ids = [line.split()[1].split('/')[-1] for line in result.stdout.splitlines()
+                   if line.strip().startswith('sec')]
+            return [i for i in ids if i.startswith(text)]
+        except (OSError, IndexError):
+            return []
 
     def do_migrate(self, arg):
         """migrate [path]  — Import old ott_manifest.jsonl / imgfs_manifest.jsonl into .ott/"""
