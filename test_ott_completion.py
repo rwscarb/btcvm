@@ -14,7 +14,6 @@ import os
 import shlex
 import tempfile
 import pytest
-from unittest.mock import patch
 
 import ott
 

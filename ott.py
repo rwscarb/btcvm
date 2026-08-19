@@ -1590,7 +1590,7 @@ def cmd_repo_tag(repo_path_or_name: str, tag: str, key_id: str | None = None, me
     ok, gpg_out = _git_verify_tag(abs_path, tag)
     if not ok:
         raise OttError(f'Tag verification failed after signing:\n{gpg_out}')
-    print(f'     Verify: ✅')
+    print('     Verify: ✅')
 
     # Record in manifest
     updates = {
@@ -1600,8 +1600,8 @@ def cmd_repo_tag(repo_path_or_name: str, tag: str, key_id: str | None = None, me
         'gpg_signed_at':   time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
     }
     store.update_entry(entry['sha256'], updates)
-    print(f'     Recorded in manifest')
-    print(f'\n  To push the tag:')
+    print('     Recorded in manifest')
+    print('\n  To push the tag:')
     print(f'     git push origin {tag}')
 
 
@@ -1652,9 +1652,9 @@ def cmd_repo_verify_tag(repo_path_or_name: str, tag: str | None = None):
     print(f'  Tag:         {tag_name}')
     print(f'  Commit:      {entry["git_hash"]}')
     if tag_ok:
-        print(f'  GPG sig:     ✅ valid')
+        print('  GPG sig:     ✅ valid')
     else:
-        print(f'  GPG sig:     ✗ invalid or repo not available')
+        print('  GPG sig:     ✗ invalid or repo not available')
     if stored_fpr:
         match = live_fpr == stored_fpr if live_fpr else None
         match_icon = '✅' if match else ('⚠️ unverified' if match is None else '✗ MISMATCH')
@@ -1677,13 +1677,13 @@ def cmd_repo_verify_tag(repo_path_or_name: str, tag: str | None = None):
     print()
     print('  Full chain:')
     print(f'    GPG key ({stored_fpr[:16] if stored_fpr else "?"}…)')
-    print(f'      ↓ signs')
+    print('      ↓ signs')
     print(f'    git tag {tag_name!r} → commit {entry["git_hash"][:16]}…')
-    print(f'      ↓ SHA256')
+    print('      ↓ SHA256')
     print(f'    Merkle leaf {entry["sha256"][:16]}…')
-    print(f'      ↓ Merkle tree')
+    print('      ↓ Merkle tree')
     print(f'    Root {root[:16]}…')
-    print(f'      ↓ Bitcoin block')
+    print('      ↓ Bitcoin block')
     ledger = store.load_ledger()
     if ledger:
         last = ledger[-1]
@@ -2224,8 +2224,8 @@ class OttShell(cmd.Cmd):
             import subprocess
             cmd_str = line[1:].strip()
             if cmd_str:
-                result = subprocess.run(cmd_str, shell=True, text=True,
-                                        capture_output=False)
+                subprocess.run(cmd_str, shell=True, text=True,
+                               capture_output=False)
             else:
                 print('  Usage: !<shell command>')
         else:
