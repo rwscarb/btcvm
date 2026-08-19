@@ -549,13 +549,27 @@ def cmd_add(paths: list[str], recursive: bool = False):
         print('  No new files staged.')
 
 
-def cmd_rm(name_or_hash: str, cwd: str = ''):
+def cmd_rm(name_or_hash: str, cwd: str = '', regex: bool = False):
     """Unstage a pending `add` — only touches files the archive hasn't
     committed yet. Once something's in the manifest (let alone anchored to
     Bitcoin), rm can't remove it; that's intentional, not a limitation to
-    work around."""
+    work around. With regex=True, name_or_hash is a bulk pattern instead of
+    a single name/hash — bare or /slash-delimited/, same convention as
+    `tag`, matched against orig_path across every staged entry."""
     store = get_store()
     staged = store.load_staged()
+
+    if regex:
+        matched = _matching_entries(staged, name_or_hash)
+        if not matched:
+            print(f'  ✗ no staged entries match {name_or_hash!r}')
+            return
+        for e in matched:
+            store.unstage_entry(e['sha256'])
+        print(f'  Unstaged {len(matched)} entr{"y" if len(matched) == 1 else "ies"}:')
+        for e in matched:
+            print(f'    - {e.get("orig_path", e["name"])}  ({e["sha256"][:12]}…)')
+        return
 
     entry, err = _resolve_entry(staged, name_or_hash, cwd=cwd)
     if err:
@@ -2321,14 +2335,23 @@ class OttShell(cmd.Cmd):
         _run(cmd_add, paths, recursive)
 
     def do_rm(self, arg):
-        """rm <name_or_hash>  — Unstage a pending add. Only touches files
-        that haven't been committed yet — once archived, rm can't remove
-        them."""
+        """rm [-r] <name_or_hash_or_pattern>  — Unstage a pending add. Only
+        touches files that haven't been committed yet — once archived, rm
+        can't remove them. -r/--regex treats the argument as a bulk regex
+        pattern (bare or /slash-delimited/, same as `tag`) instead of a
+        single name/hash, matched against every staged entry's path."""
         parts = shlex.split(arg)
-        if not parts:
-            print('  Usage: rm <name_or_hash>')
+        regex = False
+        rest = []
+        for p in parts:
+            if p in ('-r', '--regex'):
+                regex = True
+            else:
+                rest.append(p)
+        if not rest:
+            print('  Usage: rm [-r] <name_or_hash_or_pattern>')
             return
-        _run(cmd_rm, parts[0], self.archive_cwd)
+        _run(cmd_rm, rest[0], self.archive_cwd, regex)
 
     def complete_rm(self, text, line, begidx, endidx):
         try:
@@ -2813,6 +2836,8 @@ def main():
 
     p_rm = sub.add_parser('rm', help='Unstage a pending add (not yet committed)')
     p_rm.add_argument('name')
+    p_rm.add_argument('-r', '--regex', action='store_true',
+                      help='Treat name as a bulk regex pattern instead of a single name/hash')
 
     sub.add_parser('status', help='Show archive status and Merkle root')
 
@@ -2911,7 +2936,7 @@ def main():
         elif args.cmd == 'add':
             cmd_add(args.paths, args.recursive)
         elif args.cmd == 'rm':
-            cmd_rm(args.name)
+            cmd_rm(args.name, regex=args.regex)
         elif args.cmd == 'status':
             cmd_status()
         elif args.cmd == 'list':
