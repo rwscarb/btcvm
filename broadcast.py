@@ -46,3 +46,10 @@ def get_balance(wif: str, network: str = 'testnet') -> int:
     check_available()
     key = load_key(wif, network)
     return key.get_balance('satoshi')
+
+
+def generate_key(network: str = 'testnet'):
+    """Generate a fresh wallet key for broadcasting commitments. Returns the
+    bit key object — caller reads .to_wif() and .address off it."""
+    check_available()
+    return PrivateKey() if network == 'mainnet' else PrivateKeyTestnet()

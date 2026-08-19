@@ -1086,6 +1086,36 @@ def cmd_broadcast(commitment: str | None, wif: str, network: str = 'testnet'):
         print('  Recorded tx_hash on the matching ledger entry.')
 
 
+def cmd_keygen(network: str = 'testnet'):
+    """Generate a fresh wallet key for `ott broadcast`. Deliberately does
+    NOT QR the WIF — a QR code of a private key sitting in terminal
+    scrollback or a screen recording is a real exposure risk; only the
+    address (safe, public, meant to be shared so you can fund it) gets
+    one. This isn't otto's OTTO_PRIVKEY/OTTO_PUBKEY (a raw hex secp256k1
+    keypair for node identity/signing) — a different project, different
+    key format (WIF vs raw hex), not interchangeable."""
+    from broadcast import generate_key
+
+    try:
+        key = generate_key(network)
+    except RuntimeError as e:
+        print(f'  ✗ {e}')
+        return
+
+    wif = key.to_wif()
+    address = key.address
+    print(f'  Network: {network}')
+    print(f'  Address: {address}')
+    print(f'  WIF:     {wif}')
+    print()
+    print('  ⚠️  WIF is a private key — anyone who has it controls these funds.')
+    print('     Do not commit it, screenshot it, or paste it anywhere public.')
+    print(f'     Store it somewhere safe, then fund the address above ({"real" if network == "mainnet" else "test"} BTC),')
+    print('     and use it with: ott broadcast --wif <WIF> ' + ('' if network == 'mainnet' else '--network testnet'))
+    print()
+    cmd_qr(address, label='funding address (safe to share)')
+
+
 def _resolve_entry(entries: list[dict], ref: str, type_filter: str | None = None):
     """Resolve a hash-prefix / orig_path / basename reference to one manifest entry.
 
@@ -2301,6 +2331,20 @@ class OttShell(cmd.Cmd):
             return
         _run(cmd_broadcast, rest[0] if rest else None, wif, network)
 
+    def do_keygen(self, arg):
+        """keygen [--network testnet|mainnet]  — Generate a fresh wallet
+        key for `ott broadcast`. Prints the WIF (keep private) and a QR
+        of the funding address only (safe to share)."""
+        parts = shlex.split(arg)
+        network = 'testnet'
+        i = 0
+        while i < len(parts):
+            if parts[i] == '--network' and i + 1 < len(parts):
+                i += 1
+                network = parts[i]
+            i += 1
+        _run(cmd_keygen, network)
+
     def do_verify(self, arg):
         """verify <file>  — Merkle inclusion proof for a file."""
         parts = shlex.split(arg)
@@ -2597,6 +2641,9 @@ def main():
     p_bc.add_argument('--wif', required=True, help='Wallet WIF private key')
     p_bc.add_argument('--network', default='testnet', choices=['testnet', 'mainnet'])
 
+    p_kg = sub.add_parser('keygen', help='Generate a fresh wallet key for ott broadcast')
+    p_kg.add_argument('--network', default='testnet', choices=['testnet', 'mainnet'])
+
     p_verify = sub.add_parser('verify', help='Merkle inclusion proof for a file')
     p_verify.add_argument('path')
 
@@ -2661,6 +2708,8 @@ def main():
             cmd_commit()
         elif args.cmd == 'broadcast':
             cmd_broadcast(args.commitment, args.wif, args.network)
+        elif args.cmd == 'keygen':
+            cmd_keygen(args.network)
         elif args.cmd == 'verify':
             cmd_verify(args.path)
         elif args.cmd == 'verify-chain':
