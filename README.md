@@ -123,26 +123,37 @@ video.mp4  → [chunk₀, chunk₁, …, chunkₙ] → file root ┘
 ```
 
 ```bash
-# Add files (images or video — detected by extension)
+# Stage files (images or video — detected by extension). Hashed now — that's
+# what identifies the file and catches duplicates — but not yet copied into
+# object storage or written to the manifest.
 python3 ott.py add photo.jpg family.jpg video.mp4
 
-# Show current archive state and Merkle root
+# Show what's staged vs. already archived, and the current Merkle root
 python3 ott.py status
+
+# Changed your mind about a staged file? Drop it before it's archived.
+# (Only works pre-commit — once a file's archived, rm can't touch it.)
+python3 ott.py rm family.jpg
+
+# Archive everything staged, then commit the Merkle root to the btcvm
+# ledger (sync is a plain alias for commit — same thing, either name)
+python3 ott.py commit
 
 # List all archived files
 python3 ott.py list
 
-# Commit current Merkle root to the btcvm ledger
-python3 ott.py commit
-
-# Then anchor on-chain (optional)
-python3 broadcast.py <commitment>
+# Generate a wallet key, then anchor the commitment on-chain (optional)
+python3 ott.py keygen --network testnet
+python3 ott.py broadcast --wif <WIF_KEY>
 
 # Verify a file is in the archive (Merkle inclusion proof)
 python3 ott.py verify photo.jpg
 
 # Prove a specific 256 KB chunk of a video is in the archive
 python3 ott.py verify-chunk video.mp4 3
+
+# Verify every ledger commit against real Bitcoin, not just internal state
+python3 ott.py verify-chain
 ```
 
 **Interactive shell:**
@@ -157,19 +168,31 @@ things the flat CLI doesn't have:
 
 | Command | Description |
 |---|---|
+| `add [-r] <file>...` | Stage files (git-index style) — hashed now, archived on `commit`/`sync` |
+| `rm <name_or_hash>` | Unstage a pending `add`; refuses once a file's actually committed |
+| `commit` / `sync` | Archive everything staged, then commit the Merkle root to the ledger (same action, either name) |
 | `l [-a] [-t tag] [-b] [dir]` | One-level `ls`-style view of the archive hierarchy (from `orig_path`) |
 | `tree [-a] [-t tag] [-dN] [-b] [dir]` | Recursive tree view; `-d0` for unlimited depth |
 | `cd`, `pwd` | Navigate the *archive* hierarchy (real filesystem nav is `lcd`/`lpwd`) |
 | `list` / `ls [pattern]` | Full flat dump of every path in one table, optionally filtered by regex (bare or `/slash-delimited/`) |
+| `open <name_or_hash>` | Open an archived file with the OS default handler (prefers the live copy, falls back to the archived one) |
 | `mv <name> <new_path>` | Update an entry's tracked path; moves into an existing dir like real `mv` |
 | `reindex [root]` | One indexed filesystem scan — relocates every stale entry and re-anchors `orig_path` to the archive root |
 | `tag <add\|rm\|list> <pattern> <tagname>` | Bulk-tag entries by regex match against their archive path |
 | `repo <add\|list\|verify\|update\|tag\|verify-tag\|qr>` | Track a git repo's HEAD and (optionally) a GPG-signed release tag in the archive |
+| `verify-chain [-c]` | Verify every ledger commit against real Bitcoin (refetches each block's actual hash) — `-c` also checks the OP_RETURN landed |
+| `keygen [--network]` | Generate a wallet key for `broadcast` (prints WIF + a QR of the address only, never the key) |
+| `broadcast [--wif]` | Broadcast a commitment as a Bitcoin OP_RETURN tx |
 | `qr [hash\|file]` | QR code for a hash, a file's SHA256, or the current Merkle root |
 | `!<cmd>` | Run a real shell command without leaving the shell |
 
 Entries missing at their last known path are hidden by default in `l`/`tree`
 (`-a` shows them); `ott reindex` is the real fix.
+
+`add` only stages — nothing's copied into object storage or written to the
+manifest until `commit`/`sync`. Names/hashes resolve relative to the current
+archive directory first (`cd`-aware), only falling back to a global search
+if nothing matches locally.
 
 **Via Makefile:**
 
