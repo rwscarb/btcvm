@@ -1094,6 +1094,18 @@ def cmd_verify_chain(check_txs: bool = False):
         recorded_commitment = entry.get('commitment')
         ts = entry.get('ts', '?')
 
+        # A btcvm VM-clock ledger record (vdf_tick/registers/state_hash)
+        # has no merkle_root at all — it's a different ledger's entry, not
+        # an old ott schema. Flag it distinctly instead of a confusing
+        # "recomputed ?" — the fix is removing it from this file, not
+        # guessing at a schema that was never ott's.
+        if recorded_root is None and 'state_hash' in entry:
+            print(f'  ✗ [{i}] block {height}  {ts}')
+            print("      ✗ this looks like a btcvm VM-ledger record (has state_hash/registers), not an ott commit —")
+            print('        it likely leaked into this file from ledger.jsonl; remove that line, don\'t reconcile it')
+            all_ok = False
+            continue
+
         # Older entries predate the mainnet-only convention and carry no
         # `network` field — try mainnet first, then testnet, and report
         # whichever chain the recorded hash actually belongs to.
