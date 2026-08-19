@@ -551,12 +551,19 @@ def _breadcrumb_paths(entries: list[dict]) -> tuple[str, dict[str, str]]:
     return breadcrumb, display
 
 
-def cmd_list(human: bool = True):
+def cmd_list(human: bool = True, pattern: str | None = None):
     store = get_store()
     entries = store.load_manifest()
     if not entries:
         print('  Archive is empty.')
         return
+    if pattern:
+        total = len(entries)
+        entries = _matching_entries(entries, pattern)
+        if not entries:
+            print(f'  ✗ no entries match {pattern!r} (of {total} total)')
+            return
+        print(f'  ({len(entries)} of {total} match {pattern!r})')
     breadcrumb, display_paths = _breadcrumb_paths(entries)
     if breadcrumb:
         print(f'  Base: /{breadcrumb}  (shared by most entries below; shown in full where it differs)')
@@ -1911,11 +1918,15 @@ class OttShell(cmd.Cmd):
         _run(cmd_status)
 
     def do_list(self, arg):
-        """list [-b]  — List all archived files (full flat dump, every path in
-        one table). Sizes are human-readable (e.g. 1.1 GB) unless -b/--bytes."""
+        """list [-b] [pattern]  — List all archived files (full flat dump, every
+        path in one table). pattern filters to paths matching a regex (bare or
+        /slash-delimited/, same syntax as `tag`). Sizes are human-readable
+        (e.g. 1.1 GB) unless -b/--bytes."""
         parts = shlex.split(arg)
         human = not any(p in ('-b', '--bytes') for p in parts)
-        _run(cmd_list, human)
+        rest = [p for p in parts if p not in ('-b', '--bytes')]
+        pattern = rest[0] if rest else None
+        _run(cmd_list, human, pattern)
 
     def _parse_ls_flags(self, arg: str) -> tuple[list[str], bool, str | None, bool]:
         """Shared -a/--all, -t/--tag <name>, and -b/--bytes parsing for ls/tree."""
@@ -1958,7 +1969,8 @@ class OttShell(cmd.Cmd):
         return rest, depth
 
     def do_ls(self, arg):
-        """ls [-b]  — alias for list (full flat dump, every path in one table)."""
+        """ls [-b] [pattern]  — alias for list (full flat dump, every path in
+        one table, optionally filtered by regex — see `help list`)."""
         self.do_list(arg)
 
     def do_tree(self, arg):
@@ -2310,6 +2322,8 @@ def main():
     sub.add_parser('status', help='Show archive status and Merkle root')
 
     p_list = sub.add_parser('list', help='List all archived files (full flat dump)')
+    p_list.add_argument('pattern', nargs='?', default=None,
+                        help='Only show paths matching this regex (bare or /slash-delimited/)')
     p_list.add_argument('-b', '--bytes', action='store_true',
                         help='Show exact byte counts instead of human-readable sizes')
 
@@ -2387,7 +2401,7 @@ def main():
         elif args.cmd == 'status':
             cmd_status()
         elif args.cmd == 'list':
-            cmd_list(not args.bytes)
+            cmd_list(not args.bytes, args.pattern)
         elif args.cmd == 'ls':
             cmd_ls(args.dir, args.all, args.tag, not args.bytes)
         elif args.cmd == 'tree':
