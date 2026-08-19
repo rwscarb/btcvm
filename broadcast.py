@@ -45,7 +45,10 @@ def get_balance(wif: str, network: str = 'testnet') -> int:
     """Return balance in satoshis."""
     check_available()
     key = load_key(wif, network)
-    return key.get_balance('satoshi')
+    # bit's get_balance() returns a string despite the amount always being
+    # a whole number of satoshis — cast so this function's own -> int
+    # contract is actually true, not just a type hint that happens to lie.
+    return int(key.get_balance('satoshi'))
 
 
 def generate_key(network: str = 'testnet'):
