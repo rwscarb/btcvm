@@ -1538,6 +1538,54 @@ def cmd_restore(name_or_hash: str, dest: str):
     print(f'  ✅ Restored {entry["name"]} → {dest_abs}')
 
 
+def cmd_open(name_or_hash: str):
+    """Open an archived file (or repo directory) with the OS default
+    handler. Prefers the live copy at last_path if it's still there —
+    faster, and edits/opens the real location — falling back to the
+    archived object copy (read-only, content-addressed by hash) if the
+    original's gone. Repos have no object copy; only last_path applies."""
+    import subprocess
+
+    store = get_store()
+    entries = store.load_manifest()
+
+    entry, err = _resolve_entry(entries, name_or_hash)
+    if err:
+        print(err)
+        return
+    if entry is None:
+        print(f'  ✗ {name_or_hash} not in archive')
+        return
+
+    is_repo = entry.get('type') == 'repo'
+    last_path = entry.get('last_path', '')
+    target = None
+    if (os.path.isdir(last_path) if is_repo else os.path.isfile(last_path)):
+        target = last_path
+    elif not is_repo:
+        obj_path = store.object_path(entry['sha256'])
+        if os.path.isfile(obj_path):
+            target = obj_path
+
+    if target is None:
+        if is_repo:
+            print(f'  ✗ {entry["name"]} not found at {last_path or "(no last_path recorded)"} '
+                  f'— repos have no archived copy to fall back to')
+        else:
+            print(f'  ✗ {entry["name"]} not found at last_path and no archived copy — '
+                  f'run `ott find {entry["name"]}` to locate it')
+        return
+
+    opener = 'open' if sys.platform == 'darwin' else 'xdg-open'
+    try:
+        subprocess.Popen([opener, target], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, start_new_session=True)
+    except FileNotFoundError:
+        print(f'  ✗ {opener!r} not found — install it, or open manually: {target}')
+        return
+    print(f'  Opening {entry["name"]}  ({target})')
+
+
 def cmd_backfill():
     """Store archive copies for entries that are on disk but not yet object-stored."""
     store = get_store()
@@ -2448,6 +2496,19 @@ class OttShell(cmd.Cmd):
             return self._manifest_names(text)
         return self._files(text)
 
+    def do_open(self, arg):
+        """open <name_or_hash>  — Open an archived file with the OS default
+        handler (prefers the live copy at last_path, falls back to the
+        archived object copy)."""
+        parts = shlex.split(arg)
+        if not parts:
+            print('  Usage: open <name_or_hash>')
+            return
+        _run(cmd_open, parts[0])
+
+    def complete_open(self, text, line, begidx, endidx):
+        return self._manifest_names(text)
+
     def do_backfill(self, _arg):
         """backfill  — Store archive copies for entries on disk but not yet object-stored."""
         _run(cmd_backfill)
@@ -2671,6 +2732,9 @@ def main():
     p_restore.add_argument('name')
     p_restore.add_argument('dest')
 
+    p_open = sub.add_parser('open', help='Open an archived file with the OS default handler')
+    p_open.add_argument('name')
+
     sub.add_parser('backfill', help='Store archive copies for entries found on disk but not yet stored')
 
     p_qr = sub.add_parser('qr', help='QR code for a hash, file, or current root')
@@ -2724,6 +2788,8 @@ def main():
             cmd_mv(args.name, args.new_path)
         elif args.cmd == 'restore':
             cmd_restore(args.name, args.dest)
+        elif args.cmd == 'open':
+            cmd_open(args.name)
         elif args.cmd == 'backfill':
             cmd_backfill()
         elif args.cmd == 'qr':
