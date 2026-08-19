@@ -2160,6 +2160,9 @@ class OttShell(cmd.Cmd):
         check_txs = any(p in ('--check-txs', '-c') for p in parts)
         _run(cmd_verify_chain, check_txs)
 
+    def complete_verify_chain(self, text, line, begidx, endidx):
+        return [f for f in ('-c', '--check-txs') if f.startswith(text)]
+
     def do_verify_chunk(self, arg):
         """verify_chunk <file> <chunk>  — Byte-range inclusion proof for a video chunk."""
         parts = shlex.split(arg)
