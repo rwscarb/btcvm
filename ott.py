@@ -729,11 +729,14 @@ def cmd_ls(path_filter: str | None = None, show_all: bool = False, tag: str | No
         hidden = (len(d2) - len(d1)) + (len(f2) - len(f1))
         if hidden:
             flag = f'-a --tag {tag}' if tag else '-a'
+            hint_cmd = 'l' if _IN_SHELL else 'ott ls'
             print(f'\n  ({hidden} missing/malformed-path item{"s" if hidden != 1 else ""} hidden — '
-                  f'use `ott ls {flag}{" " + prefix if prefix else ""}` to show, or `ott reindex` to fix)')
+                  f'use `{hint_cmd} {flag}{" " + prefix if prefix else ""}` to show, or `ott reindex` to fix)')
 
     child = f'{prefix}/<name>' if prefix else '<name>'
-    print(f'\n  Drill in with: ott ls {child}   or see everything at once with: ott list')
+    hint_cmd = 'l' if _IN_SHELL else 'ott ls'
+    list_cmd = 'ls' if _IN_SHELL else 'ott list'
+    print(f'\n  Drill in with: {hint_cmd} {child}   or see everything at once with: {list_cmd}')
 
 
 def cmd_tree(path_filter: str | None = None, show_all: bool = False, tag: str | None = None,
@@ -1756,6 +1759,12 @@ def cmd_qr(data: str, label: str = ''):
 
 # ── Interactive shell ─────────────────────────────────────────────────────────
 
+# Set by OttShell.__init__ so cmd_ls's printed hints can name the right
+# command — the interactive shell aliases `l` to cmd_ls (`ls` is the flat
+# dump instead, per an earlier swap), while the `ott` CLI keeps `ls` as-is.
+_IN_SHELL = False
+
+
 def _run(fn, *args, **kwargs):
     """Call a cmd_* function, printing errors neatly."""
     try:
@@ -1778,6 +1787,8 @@ class OttShell(cmd.Cmd):
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self.archive_cwd = ''  # current dir *within the archive hierarchy*, '' = root
+        global _IN_SHELL
+        _IN_SHELL = True
 
     def preloop(self):
         try:
@@ -1869,6 +1880,9 @@ class OttShell(cmd.Cmd):
         path = next((p for p in parts if not p.startswith('--')), '.')
         migrate = '--migrate' in parts
         _run(cmd_init, path, migrate)
+
+    def complete_init(self, text, line, begidx, endidx):
+        return self._files(text)
 
     def do_add(self, arg):
         """add [-r] <file> [file ...]  — Add images or video (dirs need -r/--recursive)."""
@@ -2082,6 +2096,9 @@ class OttShell(cmd.Cmd):
         parts = shlex.split(arg)
         _run(cmd_reindex, parts[0] if parts else None)
 
+    def complete_reindex(self, text, line, begidx, endidx):
+        return self._files(text)
+
     def do_repo(self, arg):
         """repo <add|list|verify|update|tag|verify-tag|qr> [args]  — Archive git repos."""
         parts = shlex.split(arg)
@@ -2110,6 +2127,9 @@ class OttShell(cmd.Cmd):
         """migrate [path]  — Import old ott_manifest.jsonl / imgfs_manifest.jsonl into .ott/"""
         parts = shlex.split(arg)
         _run(cmd_migrate, parts[0] if parts else None)
+
+    def complete_migrate(self, text, line, begidx, endidx):
+        return self._files(text)
 
     def do_mv(self, arg):
         """mv <name> <new_path>  — Update last_path (and name) for an entry."""
@@ -2168,6 +2188,9 @@ class OttShell(cmd.Cmd):
         except OSError as e:
             print(f'  ✗ {e}')
 
+    def complete_lcd(self, text, line, begidx, endidx):
+        return self._files(text)
+
     def do_ls_dir(self, arg):
         """ls_dir [path]  — List directory contents on disk (alias: lls)."""
         path = os.path.expanduser(shlex.split(arg)[0]) if arg.strip() else '.'
@@ -2179,6 +2202,9 @@ class OttShell(cmd.Cmd):
                 print(f'  {name}{suffix}')
         except OSError as e:
             print(f'  ✗ {e}')
+
+    def complete_ls_dir(self, text, line, begidx, endidx):
+        return self._files(text)
 
     def default(self, line):
         """Pass through !cmd to shell."""
@@ -2225,6 +2251,9 @@ class OttShell(cmd.Cmd):
     def do_lls(self, a):
         """lls [path]  — local list (list directory contents on disk)"""
         self.do_ls_dir(a)
+
+    def complete_lls(self, text, line, begidx, endidx):
+        return self._files(text)
 
     def do_st(self, a):
         """st  — status"""
