@@ -1116,12 +1116,16 @@ def cmd_keygen(network: str = 'testnet'):
     cmd_qr(address, label='funding address (safe to share)')
 
 
-def _resolve_entry(entries: list[dict], ref: str, type_filter: str | None = None):
+def _resolve_entry(entries: list[dict], ref: str, type_filter: str | None = None, cwd: str = ''):
     """Resolve a hash-prefix / orig_path / basename reference to one manifest entry.
 
     Returns (entry_or_None, error_or_None). Basename matches that hit more than
     one entry (e.g. same filename archived from different subfolders) are
-    reported as an error instead of silently picking the first one.
+    reported as an error instead of silently picking the first one — unless
+    `cwd` (the shell's current archive directory) is given and the ref
+    resolves to exactly one entry directly under it, in which case that's
+    used without needing to disambiguate against identically-named files
+    elsewhere in the archive.
     """
     pool = entries if type_filter is None else [e for e in entries if e.get('type') == type_filter]
 
@@ -1138,6 +1142,12 @@ def _resolve_entry(entries: list[dict], ref: str, type_filter: str | None = None
             )
             return None, (f'  ✗ hash "{ref}" is ambiguous — matches {len(hash_matches)} files:\n{lines}\n'
                            f'  Use more characters to disambiguate.')
+
+    if cwd:
+        qualified = f'{cwd}/{ref}'.strip('/')
+        cwd_matches = [e for e in pool if e.get('orig_path') == qualified]
+        if len(cwd_matches) == 1:
+            return cwd_matches[0], None
 
     path_matches = [e for e in pool if e.get('orig_path') == ref]
     if len(path_matches) == 1:
@@ -1156,7 +1166,7 @@ def _resolve_entry(entries: list[dict], ref: str, type_filter: str | None = None
     return None, None
 
 
-def cmd_verify(path_or_name: str):
+def cmd_verify(path_or_name: str, cwd: str = ''):
     store = get_store()
     entries = store.load_manifest()
     leaves = [e['sha256'] for e in entries]
@@ -1165,7 +1175,7 @@ def cmd_verify(path_or_name: str):
 
     if os.path.isfile(abs_path):
         if is_video(abs_path):
-            candidate, _ = _resolve_entry(entries, path_or_name)
+            candidate, _ = _resolve_entry(entries, path_or_name, cwd=cwd)
             chunk_size = (candidate.get('chunk_size') if candidate else None) or store.chunk_size
             chunks = chunk_hashes(abs_path, chunk_size)
             digest = merkle_root(chunks) if chunks else hashlib.sha256(b'').hexdigest()
@@ -1173,7 +1183,7 @@ def cmd_verify(path_or_name: str):
             digest = sha256_file(abs_path)
         source = 'live file'
     else:
-        entry, err = _resolve_entry(entries, path_or_name)
+        entry, err = _resolve_entry(entries, path_or_name, cwd=cwd)
         if err:
             print(err)
             return
@@ -1300,11 +1310,11 @@ def cmd_verify_chain(check_txs: bool = False):
     print('  ✅ All commits verified against Bitcoin.' if all_ok else '  ✗ One or more commits failed verification.')
 
 
-def cmd_verify_chunk(path_or_name: str, chunk_idx: int):
+def cmd_verify_chunk(path_or_name: str, chunk_idx: int, cwd: str = ''):
     store = get_store()
     entries = store.load_manifest()
     name = os.path.basename(path_or_name)
-    entry, err = _resolve_entry(entries, path_or_name, type_filter='video')
+    entry, err = _resolve_entry(entries, path_or_name, type_filter='video', cwd=cwd)
     if err:
         print(err)
         return
@@ -1477,12 +1487,12 @@ def cmd_migrate(path: str | None = None):
     _do_migrate(store, search)
 
 
-def cmd_mv(name_or_hash: str, new_path: str):
+def cmd_mv(name_or_hash: str, new_path: str, cwd: str = ''):
     """Update last_path (and name if basename changed) for a manifest entry."""
     store = get_store()
     entries = store.load_manifest()
 
-    entry, err = _resolve_entry(entries, name_or_hash)
+    entry, err = _resolve_entry(entries, name_or_hash, cwd=cwd)
     if err:
         print(err)
         return
@@ -1506,12 +1516,12 @@ def cmd_mv(name_or_hash: str, new_path: str):
     print(f'  ✅ {entry["name"]} → {abs_new}  ({short}…)')
 
 
-def cmd_restore(name_or_hash: str, dest: str):
+def cmd_restore(name_or_hash: str, dest: str, cwd: str = ''):
     """Copy an archived file's content back out to dest, from the local object store."""
     store = get_store()
     entries = store.load_manifest()
 
-    entry, err = _resolve_entry(entries, name_or_hash)
+    entry, err = _resolve_entry(entries, name_or_hash, cwd=cwd)
     if err:
         print(err)
         return
@@ -1538,7 +1548,7 @@ def cmd_restore(name_or_hash: str, dest: str):
     print(f'  ✅ Restored {entry["name"]} → {dest_abs}')
 
 
-def cmd_open(name_or_hash: str):
+def cmd_open(name_or_hash: str, cwd: str = ''):
     """Open an archived file (or repo directory) with the OS default
     handler. Prefers the live copy at last_path if it's still there —
     faster, and edits/opens the real location — falling back to the
@@ -1549,7 +1559,7 @@ def cmd_open(name_or_hash: str):
     store = get_store()
     entries = store.load_manifest()
 
-    entry, err = _resolve_entry(entries, name_or_hash)
+    entry, err = _resolve_entry(entries, name_or_hash, cwd=cwd)
     if err:
         print(err)
         return
@@ -2399,7 +2409,7 @@ class OttShell(cmd.Cmd):
         if not parts:
             print('  Usage: verify <file>')
             return
-        _run(cmd_verify, parts[0])
+        _run(cmd_verify, parts[0], self.archive_cwd)
 
     def do_verify_chain(self, arg):
         """verify_chain [--check-txs]  — Verify every ledger commit against
@@ -2420,7 +2430,7 @@ class OttShell(cmd.Cmd):
             print('  Usage: verify_chunk <file> <chunk_index>')
             return
         try:
-            _run(cmd_verify_chunk, parts[0], int(parts[1]))
+            _run(cmd_verify_chunk, parts[0], int(parts[1]), self.archive_cwd)
         except ValueError:
             print('  Chunk index must be an integer.')
 
@@ -2480,7 +2490,7 @@ class OttShell(cmd.Cmd):
         if len(parts) < 2:
             print('  Usage: mv <name_or_hash> <new_path>')
             return
-        _run(cmd_mv, parts[0], parts[1])
+        _run(cmd_mv, parts[0], parts[1], self.archive_cwd)
 
     def do_restore(self, arg):
         """restore <name_or_hash> <dest>  — Copy an archived file's content back out to dest."""
@@ -2488,7 +2498,7 @@ class OttShell(cmd.Cmd):
         if len(parts) < 2:
             print('  Usage: restore <name_or_hash> <dest>')
             return
-        _run(cmd_restore, parts[0], os.path.expanduser(parts[1]))
+        _run(cmd_restore, parts[0], os.path.expanduser(parts[1]), self.archive_cwd)
 
     def complete_restore(self, text, line, begidx, endidx):
         parts = shlex.split(line[:begidx])
@@ -2504,7 +2514,7 @@ class OttShell(cmd.Cmd):
         if not parts:
             print('  Usage: open <name_or_hash>')
             return
-        _run(cmd_open, parts[0])
+        _run(cmd_open, parts[0], self.archive_cwd)
 
     def complete_open(self, text, line, begidx, endidx):
         return self._manifest_names(text)
