@@ -1987,9 +1987,19 @@ def cmd_open(name_or_hash: str, cwd: str = ''):
 
 
 def cmd_backfill():
-    """Store archive copies for entries that are on disk but not yet object-stored."""
+    """Store archive copies for entries that are on disk but not yet stored
+    under the currently active backend. This is also the migration path
+    when switching backends (e.g. local → S3 after setting OTT_BACKEND=s3):
+    has_object/put_object check the *new* backend, so everything already
+    archived locally looks "missing" from S3's point of view until this
+    runs. Source preference is last_path (the live original) first, falling
+    back to the plain local .ott/objects/ copy (independent of whichever
+    backend is currently configured) if the original has since moved —
+    the bytes already archived locally are a perfectly good upload source
+    even when they're not what's about to be checked for existence."""
     store = get_store()
     entries = store.load_manifest()
+    local_objects = LocalStorageBackend(store.objects_dir)
     done = had = missing = 0
 
     for e in entries:
@@ -2000,6 +2010,8 @@ def cmd_backfill():
             continue
         last_path = e.get('last_path', '')
         if not os.path.isfile(last_path):
+            last_path = local_objects.ensure_local(e['sha256'])
+        if not last_path:
             missing += 1
             continue
         store.put_object(e['sha256'], last_path)
