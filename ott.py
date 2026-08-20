@@ -1992,6 +1992,18 @@ def cmd_open(name_or_hash: str, cwd: str = ''):
     print(f'  Opening {entry["name"]}  ({target})')
 
 
+def _render_progress(done: int, total: int, suffix: str = '', width: int = 30):
+    """One-line, in-place progress bar (stdlib only — no tqdm dependency,
+    matching the rest of the project). '\\x1b[K' clears any leftover tail
+    from a longer previous line (e.g. a longer filename) instead of
+    padding by hand."""
+    frac = done / total if total else 1.0
+    filled = int(width * frac)
+    bar = '#' * filled + '-' * (width - filled)
+    sys.stdout.write(f'\r  [{bar}] {done}/{total} ({frac * 100:5.1f}%)  {suffix}\x1b[K')
+    sys.stdout.flush()
+
+
 def cmd_backfill(workers: int = BACKFILL_WORKERS_DEFAULT):
     """Store archive copies for entries that are on disk but not yet stored
     under the currently active backend. This is also the migration path
@@ -2009,12 +2021,19 @@ def cmd_backfill(workers: int = BACKFILL_WORKERS_DEFAULT):
     S3's exists/put, disk for local hardlink/copy), so threads help even
     under the GIL. `store.backend` is touched once up front to force its
     one-time construction (S3's boto3 client included) before any worker
-    thread can race on the lazy-init check."""
+    thread can race on the lazy-init check.
+
+    Progress renders as a single updating bar on a real terminal; piped or
+    redirected output (isatty() false — a log file, CI, etc.) falls back
+    to one line per completed file instead, since overwriting a \\r line
+    is meaningless once it's not being watched live."""
     store = get_store()
     store.backend  # force lazy backend construction before threads start
     entries = [e for e in store.load_manifest() if e.get('type') != 'repo']
     local_objects = LocalStorageBackend(store.objects_dir)
     done = had = missing = errors = 0
+    total = len(entries)
+    live = sys.stdout.isatty()
 
     def backfill_one(e: dict) -> tuple[str, dict, str | None]:
         sha = e['sha256']
@@ -2041,11 +2060,18 @@ def cmd_backfill(workers: int = BACKFILL_WORKERS_DEFAULT):
                 missing += 1
             elif status == 'error':
                 errors += 1
+                if live:
+                    sys.stdout.write('\n')
                 print(f'  ⚠️  Could not store an archive copy of {e["name"]}: {err}')
             else:
                 done += 1
-                print(f'  + stored copy of {e["name"]}')
+                if not live:
+                    print(f'  + stored copy of {e["name"]}')
+            if live:
+                _render_progress(done + had + missing + errors, total, e['name'])
 
+    if live and total:
+        sys.stdout.write('\n')
     summary = f'\n  Backfilled {done}  |  already stored {had}  |  not found on disk {missing}'
     if errors:
         summary += f'  |  failed {errors}'
