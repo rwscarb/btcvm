@@ -179,7 +179,7 @@ def default_ott_home() -> str:
 # instead of assuming a local path, so swapping local for S3 never touches
 # manifest/ledger/chunk logic at all.
 
-class ObjectBackend:
+class StorageBackend:
     """Where archived file bytes actually live."""
 
     def exists(self, sha256: str) -> bool:
@@ -202,7 +202,7 @@ class ObjectBackend:
         raise NotImplementedError
 
 
-class LocalObjectBackend(ObjectBackend):
+class LocalStorageBackend(StorageBackend):
     """Default backend — content-addressed copies under .ott/objects/,
     hardlinked from the source when possible (free), falling back to a
     full copy across filesystem boundaries or where hardlinks aren't
@@ -236,7 +236,7 @@ class LocalObjectBackend(ObjectBackend):
         return self._path(sha256)
 
 
-class S3ObjectBackend(ObjectBackend):
+class S3StorageBackend(StorageBackend):
     """Objects live at s3://<bucket>/<prefix>/<hash[:2]>/<hash>. Downloaded
     copies are cached under a local directory (default .ott/cache/) so
     repeated verify/open/restore calls don't re-fetch from S3 every time —
@@ -312,7 +312,7 @@ class S3ObjectBackend(ObjectBackend):
         return f's3://{self.bucket}/{self._key(sha256)}'
 
 
-def get_backend(store: 'OttStore') -> ObjectBackend:
+def get_backend(store: 'OttStore') -> StorageBackend:
     """Picks the object backend from .ott/config, with env var overrides —
     same convention as OTT_CHUNK_BYTES/OTT_HOME. Local is the default;
     nothing changes for existing archives unless object_backend is set
@@ -320,7 +320,7 @@ def get_backend(store: 'OttStore') -> ObjectBackend:
     cfg = store.config()
     kind = os.environ.get('OTT_BACKEND', cfg.get('object_backend', 'local'))
     if kind == 'local':
-        return LocalObjectBackend(store.objects_dir)
+        return LocalStorageBackend(store.objects_dir)
     if kind == 's3':
         bucket = os.environ.get('OTT_S3_BUCKET', cfg.get('s3_bucket'))
         if not bucket:
@@ -328,7 +328,7 @@ def get_backend(store: 'OttStore') -> ObjectBackend:
                             "or 's3_bucket' in .ott/config")
         prefix = os.environ.get('OTT_S3_PREFIX', cfg.get('s3_prefix', ''))
         cache_dir = os.environ.get('OTT_S3_CACHE_DIR', os.path.join(store.dir, 'cache'))
-        return S3ObjectBackend(bucket, prefix, cache_dir)
+        return S3StorageBackend(bucket, prefix, cache_dir)
     raise OttError(f"Unknown object_backend: {kind!r} (expected 'local' or 's3')")
 
 
@@ -342,7 +342,7 @@ class OttStore:
         self.config_path   = os.path.join(ott_dir, 'config')
         self.chunks_dir    = os.path.join(ott_dir, 'chunks')
         self.objects_dir   = os.path.join(ott_dir, 'objects')
-        self._backend: ObjectBackend | None = None
+        self._backend: StorageBackend | None = None
 
     @staticmethod
     def _create(ott_dir: str) -> 'OttStore':
@@ -367,7 +367,7 @@ class OttStore:
         return cls._create(ott_dir)
 
     @property
-    def backend(self) -> ObjectBackend:
+    def backend(self) -> StorageBackend:
         if self._backend is None:
             self._backend = get_backend(self)
         return self._backend
@@ -1329,6 +1329,52 @@ def _absorb_staged(store: 'OttStore'):
     store._write_staged(remaining)
     if absorbed:
         print(f'  Archived {absorbed} staged file(s).\n')
+
+
+# ── Validation backends (interface stub — not wired in yet) ────────────────
+#
+# StorageBackend answers "where do the bytes live." ValidationBackend is the
+# separate question "what do we anchor the Merkle root to, and how do we
+# check it later." cmd_commit/cmd_broadcast/cmd_verify_chain below ARE the
+# Bitcoin implementation today — this interface describes their shape for a
+# future second backend (Ethereum was the one discussed: same "hash in a
+# plain tx" pattern via the data field, Sepolia as the free testnet), but
+# deliberately isn't wired in yet. Extracting the real Bitcoin logic out of
+# those three functions (~300 lines, heavy on prints and error handling
+# specific to block-explorer APIs and OP_RETURN construction) is the same
+# kind of work the S3 storage backend did for LocalStorageBackend — better
+# done once Ethereum exists as a second real implementation to validate the
+# interface shape against, rather than guessed at with only one occupant.
+
+class ValidationBackend:
+    """Where the Merkle root gets anchored, and how a past anchor is
+    re-verified against the real chain. Bitcoin is today's only backend
+    and the default; nothing about existing ledgers or commits changes
+    until a second implementation lands."""
+
+    def commit(self, root: str) -> dict:
+        """Anchor `root` to the chain tip right now. Returns the ledger
+        entry to append: at minimum {ts, merkle_root, commitment}, plus
+        whatever chain-specific fields let verify() re-check it later
+        (block_height/block_hash for Bitcoin; presumably block number +
+        hash for an EVM chain)."""
+        raise NotImplementedError
+
+    def broadcast(self, commitment: str, key: str, network: str) -> str:
+        """Publish `commitment` on-chain (a real tx, costs a real fee).
+        Returns a tx identifier suitable for an explorer URL."""
+        raise NotImplementedError
+
+    def verify_entry(self, entry: dict, check_tx: bool = False) -> tuple[bool, str]:
+        """Refetch the real chain state at the entry's recorded height and
+        recompute the commitment — confirms what's on disk matches what's
+        actually on-chain, not just internal self-consistency. check_tx
+        additionally confirms the commitment was actually broadcast, not
+        just committed locally."""
+        raise NotImplementedError
+
+    def explorer_url(self, tx_hash: str, network: str) -> str:
+        raise NotImplementedError
 
 
 def cmd_commit():
