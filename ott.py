@@ -38,13 +38,14 @@ Commands:
     ott reindex [root]               relocate all stale entries + re-anchor orig_path
     ott mv photo.jpg /new/path.jpg   update path record
     ott restore photo.jpg /tmp/      copy an archived file's bytes back out
-    ott backfill                     store copies for entries added before object storage
+    ott backfill [--workers N]       store copies for entries added before object storage
     ott qr                           QR code of current Merkle root
     ott                              interactive shell (all commands + aliases)
 """
 
 import argparse
 import cmd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import os
@@ -66,7 +67,12 @@ except ImportError:
     _HAS_BOTO3 = False
 
 CHUNK_SIZE_DEFAULT = 256 * 1024  # 256 KB
+BACKFILL_WORKERS_DEFAULT = 8
 VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v', '.mts', '.ts', '.vob', '.mpg', '.mpeg', '.m2ts', '.wmv', '.flv', '.ogv'}
+
+
+def _default_backfill_workers() -> int:
+    return int(os.environ.get('OTT_BACKFILL_WORKERS', BACKFILL_WORKERS_DEFAULT))
 
 
 # ── Exceptions ────────────────────────────────────────────────────────────────
@@ -1986,7 +1992,7 @@ def cmd_open(name_or_hash: str, cwd: str = ''):
     print(f'  Opening {entry["name"]}  ({target})')
 
 
-def cmd_backfill():
+def cmd_backfill(workers: int = BACKFILL_WORKERS_DEFAULT):
     """Store archive copies for entries that are on disk but not yet stored
     under the currently active backend. This is also the migration path
     when switching backends (e.g. local → S3 after setting OTT_BACKEND=s3):
@@ -1996,29 +2002,54 @@ def cmd_backfill():
     back to the plain local .ott/objects/ copy (independent of whichever
     backend is currently configured) if the original has since moved —
     the bytes already archived locally are a perfectly good upload source
-    even when they're not what's about to be checked for existence."""
+    even when they're not what's about to be checked for existence.
+
+    Runs `workers` entries concurrently (default 8, override with
+    --workers or OTT_BACKFILL_WORKERS) — this is I/O-bound (network for
+    S3's exists/put, disk for local hardlink/copy), so threads help even
+    under the GIL. `store.backend` is touched once up front to force its
+    one-time construction (S3's boto3 client included) before any worker
+    thread can race on the lazy-init check."""
     store = get_store()
-    entries = store.load_manifest()
+    store.backend  # force lazy backend construction before threads start
+    entries = [e for e in store.load_manifest() if e.get('type') != 'repo']
     local_objects = LocalStorageBackend(store.objects_dir)
-    done = had = missing = 0
+    done = had = missing = errors = 0
 
-    for e in entries:
-        if e.get('type') == 'repo':
-            continue
-        if store.has_object(e['sha256']):
-            had += 1
-            continue
-        last_path = e.get('last_path', '')
-        if not os.path.isfile(last_path):
-            last_path = local_objects.ensure_local(e['sha256'])
-        if not last_path:
-            missing += 1
-            continue
-        store.put_object(e['sha256'], last_path)
-        done += 1
-        print(f'  + stored copy of {e["name"]}')
+    def backfill_one(e: dict) -> tuple[str, dict, str | None]:
+        sha = e['sha256']
+        if store.has_object(sha):
+            return ('had', e, None)
+        src = e.get('last_path', '')
+        if not os.path.isfile(src):
+            src = local_objects.ensure_local(sha)
+        if not src:
+            return ('missing', e, None)
+        try:
+            store.put_object(sha, src)
+        except OSError as exc:
+            return ('error', e, str(exc))
+        return ('done', e, None)
 
-    print(f'\n  Backfilled {done}  |  already stored {had}  |  not found on disk {missing}')
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = [pool.submit(backfill_one, e) for e in entries]
+        for fut in as_completed(futures):
+            status, e, err = fut.result()
+            if status == 'had':
+                had += 1
+            elif status == 'missing':
+                missing += 1
+            elif status == 'error':
+                errors += 1
+                print(f'  ⚠️  Could not store an archive copy of {e["name"]}: {err}')
+            else:
+                done += 1
+                print(f'  + stored copy of {e["name"]}')
+
+    summary = f'\n  Backfilled {done}  |  already stored {had}  |  not found on disk {missing}'
+    if errors:
+        summary += f'  |  failed {errors}'
+    print(summary)
 
 
 # ── Git / repo ───────────────────────────────────────────────────────────────
@@ -2986,9 +3017,20 @@ class OttShell(cmd.Cmd):
     def complete_open(self, text, line, begidx, endidx):
         return self._manifest_names(text)
 
-    def do_backfill(self, _arg):
-        """backfill  — Store archive copies for entries on disk but not yet object-stored."""
-        _run(cmd_backfill)
+    def do_backfill(self, arg):
+        """backfill [--workers N]  — Store archive copies for entries on
+        disk but not yet object-stored, N at a time concurrently (default
+        8, or OTT_BACKFILL_WORKERS)."""
+        parts = shlex.split(arg)
+        workers = _default_backfill_workers()
+        if '--workers' in parts:
+            i = parts.index('--workers')
+            if i + 1 < len(parts):
+                workers = int(parts[i + 1])
+        _run(cmd_backfill, workers)
+
+    def complete_backfill(self, text, line, begidx, endidx):
+        return [f for f in ('--workers',) if f.startswith(text)]
 
     def do_qr(self, arg):
         """qr [hash|file]  — QR code for a hash, file SHA256, or current Merkle root."""
@@ -3218,7 +3260,9 @@ def main():
     p_open = sub.add_parser('open', help='Open an archived file with the OS default handler')
     p_open.add_argument('name')
 
-    sub.add_parser('backfill', help='Store archive copies for entries found on disk but not yet stored')
+    p_backfill = sub.add_parser('backfill', help='Store archive copies for entries found on disk but not yet stored')
+    p_backfill.add_argument('--workers', type=int, default=None,
+                             help='Concurrent uploads (default 8, or OTT_BACKFILL_WORKERS)')
 
     p_qr = sub.add_parser('qr', help='QR code for a hash, file, or current root')
     p_qr.add_argument('target', nargs='?')
@@ -3278,7 +3322,7 @@ def main():
         elif args.cmd == 'open':
             cmd_open(args.name)
         elif args.cmd == 'backfill':
-            cmd_backfill()
+            cmd_backfill(args.workers if args.workers is not None else _default_backfill_workers())
         elif args.cmd == 'qr':
             t = args.target
             if not t:
