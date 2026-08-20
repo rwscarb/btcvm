@@ -8,11 +8,16 @@ global archive at ~/.ott (override with OTT_HOME) so there's always
 somewhere to write — `ott init` is optional, not required.
 
     .ott/
-      config          # JSON: chunk_size, created, version
+      config          # JSON: chunk_size, created, version, object_backend, s3_bucket, s3_prefix
       manifest.jsonl  # per-file records; last-write-wins on sha256
       ledger.jsonl    # Bitcoin commitments
       chunks/         # <file_root_hash>.json — chunk lists (video only)
-      objects/        # <hash[:2]>/<hash> — content-addressed copies (hardlinked when possible)
+      objects/        # <hash[:2]>/<hash> — content-addressed copies (local backend, default)
+      cache/          # local cache of downloaded objects (s3 backend only)
+
+Object storage backend defaults to local (.ott/objects/). Switch to S3 by
+setting object_backend/s3_bucket/s3_prefix in .ott/config, or via env vars
+OTT_BACKEND=s3, OTT_S3_BUCKET, OTT_S3_PREFIX (needs `pip install btcvm[s3]`).
 
 Commands:
     ott init                         create .ott/ in current directory
@@ -53,6 +58,12 @@ try:
     _HAS_QR = True
 except ImportError:
     _HAS_QR = False
+
+try:
+    import boto3  # pip install boto3  (or: pip install btcvm[s3])
+    _HAS_BOTO3 = True
+except ImportError:
+    _HAS_BOTO3 = False
 
 CHUNK_SIZE_DEFAULT = 256 * 1024  # 256 KB
 VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v', '.mts', '.ts', '.vob', '.mpg', '.mpeg', '.m2ts', '.wmv', '.flv', '.ogv'}
@@ -160,6 +171,167 @@ def default_ott_home() -> str:
     return os.environ.get('OTT_HOME', os.path.expanduser('~/.ott'))
 
 
+# ── Object storage backends ─────────────────────────────────────────────────
+#
+# Everything above (manifest, staging, ledger, chunks) is backend-agnostic —
+# it only ever deals in sha256 hashes. Only the archived *bytes* need a
+# backend, and every command that touches them goes through this interface
+# instead of assuming a local path, so swapping local for S3 never touches
+# manifest/ledger/chunk logic at all.
+
+class ObjectBackend:
+    """Where archived file bytes actually live."""
+
+    def exists(self, sha256: str) -> bool:
+        raise NotImplementedError
+
+    def put(self, sha256: str, src_path: str) -> None:
+        """Store src_path's content under sha256. No-op if already stored."""
+        raise NotImplementedError
+
+    def ensure_local(self, sha256: str) -> str | None:
+        """Return a real local filesystem path holding this object's bytes —
+        downloading/caching first if the backend is remote — or None if the
+        object isn't stored anywhere. Every caller that needs to open, copy,
+        or read archived bytes goes through this; it's the one place a
+        remote backend pays a network cost."""
+        raise NotImplementedError
+
+    def describe(self, sha256: str) -> str:
+        """Human-readable location, for status/verify output."""
+        raise NotImplementedError
+
+
+class LocalObjectBackend(ObjectBackend):
+    """Default backend — content-addressed copies under .ott/objects/,
+    hardlinked from the source when possible (free), falling back to a
+    full copy across filesystem boundaries or where hardlinks aren't
+    supported."""
+
+    def __init__(self, objects_dir: str):
+        self.objects_dir = objects_dir
+
+    def _path(self, sha256: str) -> str:
+        return os.path.join(self.objects_dir, sha256[:2], sha256)
+
+    def exists(self, sha256: str) -> bool:
+        return os.path.isfile(self._path(sha256))
+
+    def put(self, sha256: str, src_path: str) -> None:
+        dest = self._path(sha256)
+        if os.path.isfile(dest):
+            return
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        try:
+            os.link(src_path, dest)
+        except OSError:
+            import shutil
+            shutil.copy2(src_path, dest)
+
+    def ensure_local(self, sha256: str) -> str | None:
+        path = self._path(sha256)
+        return path if os.path.isfile(path) else None
+
+    def describe(self, sha256: str) -> str:
+        return self._path(sha256)
+
+
+class S3ObjectBackend(ObjectBackend):
+    """Objects live at s3://<bucket>/<prefix>/<hash[:2]>/<hash>. Downloaded
+    copies are cached under a local directory (default .ott/cache/) so
+    repeated verify/open/restore calls don't re-fetch from S3 every time —
+    the cache is disposable, never the source of truth; safe to delete."""
+
+    def __init__(self, bucket: str, prefix: str, cache_dir: str, client=None):
+        if not _HAS_BOTO3:
+            raise OttError("object_backend s3 needs boto3 — pip install boto3, "
+                            "or 'pip install btcvm[s3]'")
+        self.bucket = bucket
+        self.prefix = prefix.strip('/')
+        self.cache_dir = cache_dir
+        self._client = client  # injectable for tests
+
+    @property
+    def client(self):
+        if self._client is None:
+            self._client = boto3.client('s3')
+        return self._client
+
+    def _key(self, sha256: str) -> str:
+        parts = [self.prefix, sha256[:2], sha256] if self.prefix else [sha256[:2], sha256]
+        return '/'.join(parts)
+
+    def _cache_path(self, sha256: str) -> str:
+        return os.path.join(self.cache_dir, sha256[:2], sha256)
+
+    def exists(self, sha256: str) -> bool:
+        if os.path.isfile(self._cache_path(sha256)):
+            return True
+        from botocore.exceptions import ClientError
+        try:
+            self.client.head_object(Bucket=self.bucket, Key=self._key(sha256))
+            return True
+        except ClientError as e:
+            if e.response.get('Error', {}).get('Code') in ('404', 'NoSuchKey'):
+                return False
+            raise
+
+    def put(self, sha256: str, src_path: str) -> None:
+        if self.exists(sha256):
+            return
+        self.client.upload_file(src_path, self.bucket, self._key(sha256))
+        # Warm the local cache too — the bytes we just uploaded are right here.
+        cache_path = self._cache_path(sha256)
+        if not os.path.isfile(cache_path):
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            import shutil
+            try:
+                os.link(src_path, cache_path)
+            except OSError:
+                shutil.copy2(src_path, cache_path)
+
+    def ensure_local(self, sha256: str) -> str | None:
+        cache_path = self._cache_path(sha256)
+        if os.path.isfile(cache_path):
+            return cache_path
+        from botocore.exceptions import ClientError
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        tmp_path = cache_path + '.part'
+        try:
+            self.client.download_file(self.bucket, self._key(sha256), tmp_path)
+        except ClientError as e:
+            if e.response.get('Error', {}).get('Code') in ('404', 'NoSuchKey'):
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                return None
+            raise
+        os.replace(tmp_path, cache_path)
+        return cache_path
+
+    def describe(self, sha256: str) -> str:
+        return f's3://{self.bucket}/{self._key(sha256)}'
+
+
+def get_backend(store: 'OttStore') -> ObjectBackend:
+    """Picks the object backend from .ott/config, with env var overrides —
+    same convention as OTT_CHUNK_BYTES/OTT_HOME. Local is the default;
+    nothing changes for existing archives unless object_backend is set
+    to 's3' (in .ott/config or via OTT_BACKEND) explicitly."""
+    cfg = store.config()
+    kind = os.environ.get('OTT_BACKEND', cfg.get('object_backend', 'local'))
+    if kind == 'local':
+        return LocalObjectBackend(store.objects_dir)
+    if kind == 's3':
+        bucket = os.environ.get('OTT_S3_BUCKET', cfg.get('s3_bucket'))
+        if not bucket:
+            raise OttError("object_backend s3 needs a bucket — set OTT_S3_BUCKET "
+                            "or 's3_bucket' in .ott/config")
+        prefix = os.environ.get('OTT_S3_PREFIX', cfg.get('s3_prefix', ''))
+        cache_dir = os.environ.get('OTT_S3_CACHE_DIR', os.path.join(store.dir, 'cache'))
+        return S3ObjectBackend(bucket, prefix, cache_dir)
+    raise OttError(f"Unknown object_backend: {kind!r} (expected 'local' or 's3')")
+
+
 class OttStore:
     def __init__(self, ott_dir: str):
         self.dir           = ott_dir
@@ -170,6 +342,7 @@ class OttStore:
         self.config_path   = os.path.join(ott_dir, 'config')
         self.chunks_dir    = os.path.join(ott_dir, 'chunks')
         self.objects_dir   = os.path.join(ott_dir, 'objects')
+        self._backend: ObjectBackend | None = None
 
     @staticmethod
     def _create(ott_dir: str) -> 'OttStore':
@@ -193,28 +366,19 @@ class OttStore:
             raise OttError(f'.ott/ already exists at {ott_dir}')
         return cls._create(ott_dir)
 
-    def object_path(self, sha256: str) -> str:
-        return os.path.join(self.objects_dir, sha256[:2], sha256)
+    @property
+    def backend(self) -> ObjectBackend:
+        if self._backend is None:
+            self._backend = get_backend(self)
+        return self._backend
 
     def has_object(self, sha256: str) -> bool:
-        return os.path.isfile(self.object_path(sha256))
+        return self.backend.exists(sha256)
 
-    def put_object(self, sha256: str, src_path: str) -> str:
-        """Store a content-addressed copy of src_path. Hard-links when the
-        archive and source share a filesystem (free); falls back to a full
-        byte copy across filesystem boundaries (EXDEV) or where hard links
-        aren't supported.
-        """
-        dest = self.object_path(sha256)
-        if os.path.isfile(dest):
-            return dest
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        try:
-            os.link(src_path, dest)
-        except OSError:
-            import shutil
-            shutil.copy2(src_path, dest)
-        return dest
+    def put_object(self, sha256: str, src_path: str) -> None:
+        """Store a content-addressed copy of src_path via the configured
+        object backend (local hardlink/copy, or upload to S3)."""
+        self.backend.put(sha256, src_path)
 
     def config(self) -> dict:
         if not os.path.exists(self.config_path):
@@ -1374,9 +1538,8 @@ def cmd_verify(path_or_name: str, cwd: str = ''):
             print(f'  ✗ {name} not in archive and not found on disk')
             return
         digest = entry['sha256']
-        obj_path = store.object_path(digest)
-        if os.path.isfile(obj_path):
-            source = f'archived copy at {obj_path}'
+        if store.has_object(digest):
+            source = f'archived copy at {store.backend.describe(digest)}'
         else:
             source = f'manifest only (file not found at {entry.get("last_path", "?")})'
             print('  ⚠️  File not at last known path, and no archived copy — proof uses stored hash only')
@@ -1712,8 +1875,8 @@ def cmd_restore(name_or_hash: str, dest: str, cwd: str = ''):
         print(f'  ✗ {name_or_hash} not in archive')
         return
 
-    obj_path = store.object_path(entry['sha256'])
-    if not os.path.isfile(obj_path):
+    obj_path = store.backend.ensure_local(entry['sha256'])
+    if obj_path is None:
         print(f'  ✗ No archived copy of {entry["name"]} — only the hash was recorded '
               f'(added before object storage, or the source was on another filesystem)')
         return
@@ -1756,9 +1919,7 @@ def cmd_open(name_or_hash: str, cwd: str = ''):
     if (os.path.isdir(last_path) if is_repo else os.path.isfile(last_path)):
         target = last_path
     elif not is_repo:
-        obj_path = store.object_path(entry['sha256'])
-        if os.path.isfile(obj_path):
-            target = obj_path
+        target = store.backend.ensure_local(entry['sha256'])
 
     if target is None:
         if is_repo:
