@@ -2802,16 +2802,24 @@ class OttShell(cmd.Cmd):
     # ── completion helpers ────────────────────────────────────────────────────
 
     def _manifest_names(self, text: str) -> list[str]:
+        """Substring match, not prefix-only: readline's completer_delims
+        still splits on space (see preloop — can't drop that without
+        breaking multi-argument commands like `add file1 file2<tab>`), so
+        it only ever hands this the last space-separated fragment of
+        whatever was typed. For a name like "Gladys Delilah McIntyre -
+        Scarbery...", that means typing the literal first word is the only
+        thing a prefix match would ever complete; substring matching lets
+        any distinctive word from later in the name complete it too."""
         try:
             return [e['name'] for e in get_store().load_manifest()
-                    if e['name'].startswith(text)]
+                    if text in e['name']]
         except OttNotFoundError:
             return []
 
     def _video_names(self, text: str) -> list[str]:
         try:
             return [e['name'] for e in get_store().load_manifest()
-                    if e.get('type') == 'video' and e['name'].startswith(text)]
+                    if e.get('type') == 'video' and text in e['name']]
         except OttNotFoundError:
             return []
 
@@ -3468,6 +3476,10 @@ class OttShell(cmd.Cmd):
         """ci  — commit"""
         self.do_commit(a)
 
+    def do_o(self, a):
+        """o   — open"""
+        self.do_open(a)
+
     def do_q(self, a):
         """q   — quit"""
         return self.do_quit(a)
@@ -3475,6 +3487,7 @@ class OttShell(cmd.Cmd):
     def complete_a(self, *a):    return self.complete_add(*a)
     def complete_v(self, *a):    return self.complete_verify(*a)
     def complete_vc(self, *a):   return self.complete_verify_chunk(*a)
+    def complete_o(self, *a):    return self.complete_open(*a)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
