@@ -2823,6 +2823,19 @@ class OttShell(cmd.Cmd):
             return '"' + s.replace('"', '\\"') + '"'
         return s
 
+    def _dequote(self, text: str) -> str:
+        """Strip a leading quote from completion input before matching.
+        Quote isn't a readline delimiter (can't be — see preloop), so once
+        a completed candidate with a space in it has been inserted as
+        "Some Name...", that opening quote sticks around in the buffer.
+        Backspace into it and hit tab again and every complete_* method
+        would otherwise receive text like '"Documents/Books/Comics/' —
+        which matches nothing, since no real name starts with a literal
+        quote character — silently killing completion until the quote is
+        manually deleted. Stripping it here means completion keeps working
+        through an edit, not just on the first, never-touched-again guess."""
+        return text[1:] if text.startswith('"') else text
+
     def _manifest_names(self, text: str) -> list[str]:
         """Substring match, not prefix-only: readline's completer_delims
         still splits on space (see preloop — can't drop that without
@@ -2832,6 +2845,7 @@ class OttShell(cmd.Cmd):
         Scarbery...", that means typing the literal first word is the only
         thing a prefix match would ever complete; substring matching lets
         any distinctive word from later in the name complete it too."""
+        text = self._dequote(text)
         try:
             return [self._quote(e['name']) for e in get_store().load_manifest()
                     if text in e['name']]
@@ -2839,6 +2853,7 @@ class OttShell(cmd.Cmd):
             return []
 
     def _video_names(self, text: str) -> list[str]:
+        text = self._dequote(text)
         try:
             return [self._quote(e['name']) for e in get_store().load_manifest()
                     if e.get('type') == 'video' and text in e['name']]
@@ -2855,6 +2870,7 @@ class OttShell(cmd.Cmd):
         for cd/ls/tree: 'some-direc<tab>' matches the directory name and
         offers 'some-directory/' to keep descending, rather than every
         archived file whose basename happens to contain that substring."""
+        text = self._dequote(text)
         try:
             entries = get_store().load_manifest()
         except OttNotFoundError:
@@ -2978,6 +2994,7 @@ class OttShell(cmd.Cmd):
         _run(cmd_rm, rest[0], self.archive_cwd, regex)
 
     def complete_rm(self, text, line, begidx, endidx):
+        text = self._dequote(text)
         try:
             return [self._quote(e['name']) for e in get_store().load_staged() if e['name'].startswith(text)]
         except OttNotFoundError:
@@ -3115,6 +3132,7 @@ class OttShell(cmd.Cmd):
 
     def complete_cd(self, text, line, begidx, endidx):
         out = self._archive_dir_names(text)
+        text = self._dequote(text)
         if '/' not in text:
             try:
                 out += [self._quote(e['name']) for e in get_store().load_manifest()
@@ -3147,6 +3165,7 @@ class OttShell(cmd.Cmd):
     def _archive_dir_names(self, text: str) -> list[str]:
         """Tab-complete dir names for cd/ls/tree, relative to the current
         archive dir. Handles a partial multi-segment path like '82/2'."""
+        text = self._dequote(text)
         try:
             entries = get_store().load_manifest()
         except OttNotFoundError:
