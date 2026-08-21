@@ -1122,7 +1122,7 @@ def cmd_ls(path_filter: str | None = None, show_all: bool = False, tag: str | No
     print(f'  /{prefix}' if prefix else '  /')
     if tag:
         print(f'  (filtered to tag: {tag})')
-    print(f'  {"T":<2} {"name":<44} {"sha256":<10} {"size":>14}  {"loc":<3} {"obj":<3}')
+    print(f'  {"T":<2} {"name":<44} {"sha256":<10} {"size":>14}  {"loc":<3} {"obj":<3}  tags')
     print('  ' + '-' * 90)
     for name in sorted(dirs):
         sub = dirs[name]
@@ -1131,8 +1131,14 @@ def cmd_ls(path_filter: str | None = None, show_all: bool = False, tag: str | No
         ok = '✅ ' if n_missing == 0 else '❌ '
         n = len(sub)
         size_str = _fmt_size(total_size, human)
+        # Union of tags across everything under this directory — a
+        # directory row stands in for many entries, so there's no single
+        # tag list to show; this at least surfaces "something in here is
+        # tagged X" without requiring a drill-down to find out.
+        dir_tags = sorted({t for e in sub for t in (e.get('tags') or [])})
+        tags_str = ('  #' + ' #'.join(dir_tags)) if dir_tags else ''
         print(f'  {"D":<2} {name + "/":<44} {"·":<10} {size_str:>14}  {ok} ·   '
-              f'({n} item{"s" if n != 1 else ""})')
+              f'({n} item{"s" if n != 1 else ""}){tags_str}')
     for e in sorted(files, key=lambda e: e['name']):
         etype = e.get('type', 'image')
         t = {'video': 'V', 'repo': 'R'}.get(etype, 'I')
@@ -1141,7 +1147,9 @@ def cmd_ls(path_filter: str | None = None, show_all: bool = False, tag: str | No
         if len(display) > 44:
             display = '…' + display[-43:]
         size_str = _fmt_size(e.get('size', 0), human)
-        print(f'  {t:<2} {display:<44} {e["sha256"][:8]}…  {size_str:>14}  {ok} {backed}')
+        tags = e.get('tags') or []
+        tags_str = ('  #' + ' #'.join(tags)) if tags else ''
+        print(f'  {t:<2} {display:<44} {e["sha256"][:8]}…  {size_str:>14}  {ok} {backed}{tags_str}')
 
     if not show_all:
         vis_missing_only = _visibility_predicate(False, tag)
@@ -2823,6 +2831,33 @@ class OttShell(cmd.Cmd):
         except OttNotFoundError:
             return []
 
+    def _manifest_path_names(self, text: str) -> list[str]:
+        """For commands that resolve via _resolve_entry (open/verify/find/
+        mv/restore/qr), which accepts a hierarchical orig_path in addition
+        to a bare name — _manifest_names alone can't reflect that, since it
+        only ever offers flat basenames regardless of where in the archive
+        tree they live. This completes one path segment at a time against
+        the virtual hierarchy instead, the same way _archive_dir_names does
+        for cd/ls/tree: 'some-direc<tab>' matches the directory name and
+        offers 'some-directory/' to keep descending, rather than every
+        archived file whose basename happens to contain that substring."""
+        try:
+            entries = get_store().load_manifest()
+        except OttNotFoundError:
+            return []
+        if '/' in text:
+            head, _, tail = text.rpartition('/')
+            base = self._resolve_archive_path(head)
+            out_prefix = head + '/'
+        else:
+            base = self.archive_cwd
+            tail = text
+            out_prefix = ''
+        dirs, files = _group_children(entries, base)
+        out = [out_prefix + n + '/' for n in dirs if n.startswith(tail)]
+        out += [out_prefix + f['name'] for f in files if tail in f['name']]
+        return out
+
     def _files(self, text: str) -> list[str]:
         import glob
         expanded = os.path.expanduser(text)
@@ -2851,7 +2886,7 @@ class OttShell(cmd.Cmd):
         return self._files(text)
 
     def complete_verify(self, text, line, begidx, endidx):
-        return self._manifest_names(text) or self._files(text)
+        return self._manifest_path_names(text) or self._files(text)
 
     def complete_verify_chunk(self, text, line, begidx, endidx):
         parts = shlex.split(line[:begidx])
@@ -2869,16 +2904,16 @@ class OttShell(cmd.Cmd):
         return []
 
     def complete_find(self, text, line, begidx, endidx):
-        return self._manifest_names(text)
+        return self._manifest_path_names(text)
 
     def complete_mv(self, text, line, begidx, endidx):
         parts = shlex.split(line[:begidx])
         if len(parts) == 1:
-            return self._manifest_names(text)
+            return self._manifest_path_names(text)
         return self._files(text)
 
     def complete_qr(self, text, line, begidx, endidx):
-        return self._manifest_names(text) or self._files(text)
+        return self._manifest_path_names(text) or self._files(text)
 
     # ── commands ──────────────────────────────────────────────────────────────
 
@@ -3043,9 +3078,16 @@ class OttShell(cmd.Cmd):
         """cd [dir]  — Change the current *archive* directory (navigates the
         virtual hierarchy from orig_path, not the real filesystem — see lcd
         for that). No arg or `cd /` goes to root, `cd ..` goes up a level.
-        Sets the default target for ls/tree."""
+        Sets the default target for ls/tree.
+
+        cd'ing to a repo's name instead jumps the *local* filesystem cwd
+        (like lcd) to that repo's checkout — repos have no orig_path-based
+        virtual file tree of their own (they're archived as a single
+        commit hash, not a tree of individual files), so the only
+        meaningful thing to "enter" is the real directory on disk."""
         parts = shlex.split(arg)
-        target = self._resolve_archive_path(parts[0] if parts else '')
+        raw = parts[0] if parts else ''
+        target = self._resolve_archive_path(raw)
         if target:
             try:
                 entries = get_store().load_manifest()
@@ -3054,13 +3096,28 @@ class OttShell(cmd.Cmd):
                 return
             dirs, files = _group_children(entries, target)
             if not dirs and not files:
+                repo = next((e for e in entries
+                             if e.get('type') == 'repo' and e['name'] == raw), None)
+                if repo and os.path.isdir(repo.get('last_path', '')):
+                    os.chdir(repo['last_path'])
+                    print(f'  → local: {os.getcwd()}  '
+                          f'(repo checkout — this moved the real filesystem cwd, like lcd, '
+                          f'not the archive cd)')
+                    return
                 print(f'  ✗ no such archive directory: /{target}')
                 return
         self.archive_cwd = target
         self.prompt = f'ott:/{target}> ' if target else 'ott> '
 
     def complete_cd(self, text, line, begidx, endidx):
-        return self._archive_dir_names(text)
+        out = self._archive_dir_names(text)
+        if '/' not in text:
+            try:
+                out += [e['name'] for e in get_store().load_manifest()
+                        if e.get('type') == 'repo' and e['name'].startswith(text)]
+            except OttNotFoundError:
+                pass
+        return out
 
     def do_pwd(self, _arg):
         """pwd  — Print the current *archive* directory (see lpwd for the
@@ -3310,7 +3367,7 @@ class OttShell(cmd.Cmd):
     def complete_restore(self, text, line, begidx, endidx):
         parts = shlex.split(line[:begidx])
         if len(parts) == 1:
-            return self._manifest_names(text)
+            return self._manifest_path_names(text)
         return self._files(text)
 
     def do_open(self, arg):
@@ -3324,7 +3381,7 @@ class OttShell(cmd.Cmd):
         _run(cmd_open, parts[0], self.archive_cwd)
 
     def complete_open(self, text, line, begidx, endidx):
-        return self._manifest_names(text)
+        return self._manifest_path_names(text)
 
     def do_backfill(self, arg):
         """backfill [--workers N]  — Store archive copies for entries on
