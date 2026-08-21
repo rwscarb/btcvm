@@ -23,7 +23,7 @@ Commands:
     ott init                         create .ott/ in current directory
     ott init --migrate               init + import old ott_manifest.jsonl
     ott add photo.jpg video.mp4      add files (images or video)
-    ott add -r ./dvds                add a directory tree recursively
+    ott add ./dvds                   add a directory tree (recurses automatically)
     ott status                       current state + Merkle root
     ott list                         list archived files (full flat dump)
     ott ls [-a] [-t tag] [dir]       one-level, unix-style hierarchy view
@@ -651,7 +651,13 @@ def cmd_add(paths: list[str], recursive: bool = False):
     catches duplicates, but nothing is copied into object storage or
     written to the manifest until `ott commit`/`ott sync`. `ott rm` can
     freely drop a staged file before that; once committed, it's permanent
-    the way the rest of ott always has been."""
+    the way the rest of ott always has been.
+
+    Directories are always walked recursively — there's no shallower option
+    (_walk_files always fully recurses), so requiring -r/--recursive before
+    a directory arg was just a confirmation gate, not a real behavior
+    switch. `recursive` is accepted for backward compatibility with
+    existing scripts/muscle memory but has no effect."""
     store = get_store()
     existing = {e['sha256'] for e in store.load_manifest()}
     staged_hashes = {e['sha256'] for e in store.load_staged()}
@@ -661,9 +667,6 @@ def cmd_add(paths: list[str], recursive: bool = False):
     expanded = []
     for path in paths:
         if os.path.isdir(path):
-            if not recursive:
-                print(f'  ✗ {path} is a directory (use -r/--recursive to add its contents)')
-                continue
             files = _walk_files(path)
             if not files:
                 print(f'  (no files under {path})')
@@ -2641,10 +2644,10 @@ class OttShell(cmd.Cmd):
         return self._files(text)
 
     def do_add(self, arg):
-        """add [-r] <file> [file ...]  — Stage images or video for the
-        archive (dirs need -r/--recursive). Hashed now, but not copied into
-        object storage or written to the manifest until `commit`/`sync` —
-        `rm` can drop a staged file before then."""
+        """add <file> [file ...]  — Stage images or video for the archive
+        (directories are walked recursively automatically). Hashed now, but
+        not copied into object storage or written to the manifest until
+        `commit`/`sync` — `rm` can drop a staged file before then."""
         import glob
         tokens = shlex.split(arg)
         recursive = False
@@ -3206,7 +3209,7 @@ def main():
     p_add = sub.add_parser('add', help='Stage images or video for the archive')
     p_add.add_argument('paths', nargs='+')
     p_add.add_argument('-r', '--recursive', action='store_true',
-                        help='Recurse into directories (skips .ott/.git)')
+                        help='No longer needed — directories always recurse now (skips .ott/.git); kept for compatibility')
 
     p_rm = sub.add_parser('rm', help='Remove staged files, or archived ones added since the last commit')
     p_rm.add_argument('name')
