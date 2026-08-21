@@ -39,6 +39,7 @@ Commands:
     ott mv photo.jpg /new/path.jpg   update path record
     ott restore photo.jpg /tmp/      copy an archived file's bytes back out
     ott backfill [--workers N]       store copies for entries added before object storage
+    ott verify-objects [--workers N] audit every entry against the active backend (existence + size)
     ott qr                           QR code of current Merkle root
     ott                              interactive shell (all commands + aliases)
 """
@@ -207,6 +208,15 @@ class StorageBackend:
         """Human-readable location, for status/verify output."""
         raise NotImplementedError
 
+    def size(self, sha256: str) -> int | None:
+        """Stored object's byte size, or None if it doesn't exist. A cheap
+        completeness check — content-addressing means a full, correct
+        object's hash always matches its key, but an upload interrupted
+        mid-transfer can still land at that key with fewer bytes than it
+        should have. Comparing against the manifest's recorded size catches
+        that without re-hashing the whole object."""
+        raise NotImplementedError
+
 
 class LocalStorageBackend(StorageBackend):
     """Default backend — content-addressed copies under .ott/objects/,
@@ -240,6 +250,10 @@ class LocalStorageBackend(StorageBackend):
 
     def describe(self, sha256: str) -> str:
         return self._path(sha256)
+
+    def size(self, sha256: str) -> int | None:
+        path = self._path(sha256)
+        return os.path.getsize(path) if os.path.isfile(path) else None
 
 
 class S3StorageBackend(StorageBackend):
@@ -316,6 +330,20 @@ class S3StorageBackend(StorageBackend):
 
     def describe(self, sha256: str) -> str:
         return f's3://{self.bucket}/{self._key(sha256)}'
+
+    def size(self, sha256: str) -> int | None:
+        """Always checks S3 directly, deliberately ignoring the local
+        cache that exists()/put() use for speed — this method exists
+        specifically so verify-objects can trust it as ground truth for
+        what's really in the bucket, not a locally-cached guess."""
+        from botocore.exceptions import ClientError
+        try:
+            resp = self.client.head_object(Bucket=self.bucket, Key=self._key(sha256))
+            return resp['ContentLength']
+        except ClientError as e:
+            if e.response.get('Error', {}).get('Code') in ('404', 'NoSuchKey'):
+                return None
+            raise
 
 
 def get_backend(store: 'OttStore') -> StorageBackend:
@@ -2132,6 +2160,59 @@ def cmd_backfill(workers: int = BACKFILL_WORKERS_DEFAULT):
     print(summary)
 
 
+def cmd_verify_objects(workers: int = BACKFILL_WORKERS_DEFAULT):
+    """Audit every archived entry against the currently active backend —
+    the direct answer to "did this actually land in S3" after a backfill/
+    migration. Deliberately goes straight to the backend's size() rather
+    than has_object()/exists(): S3StorageBackend.size() always queries S3
+    directly (bypassing the local .ott/cache/ shortcut exists() uses for
+    speed), so this is checking the real bucket state, not a locally
+    cached belief about it. Compares the live size against what's
+    recorded in the manifest — same content-addressed key with the wrong
+    size means a truncated/partial transfer, not a hash collision."""
+    store = get_store()
+    store.backend  # force lazy backend construction before threads start
+    entries = [e for e in store.load_manifest() if e.get('type') != 'repo']
+    total = len(entries)
+    live = sys.stdout.isatty()
+    verified = missing = mismatched = 0
+    problems = []
+
+    def check_one(e: dict) -> tuple[str, dict, int | None]:
+        live_size = store.backend.size(e['sha256'])
+        if live_size is None:
+            return ('missing', e, None)
+        expected = e.get('size', 0)
+        if expected and live_size != expected:
+            return ('mismatched', e, live_size)
+        return ('verified', e, live_size)
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = [pool.submit(check_one, e) for e in entries]
+        for fut in as_completed(futures):
+            status, e, live_size = fut.result()
+            if status == 'verified':
+                verified += 1
+            elif status == 'missing':
+                missing += 1
+                problems.append(f'  ✗ missing: {e["name"]}  ({store.backend.describe(e["sha256"])})')
+            else:
+                mismatched += 1
+                problems.append(f'  ⚠️  size mismatch: {e["name"]}  '
+                                 f'(expected {e.get("size", 0):,} bytes, found {live_size:,})')
+            if live:
+                _render_progress(verified + missing + mismatched, total, e['name'])
+
+    if live and total:
+        sys.stdout.write('\n')
+    if problems:
+        print()
+        for p in problems:
+            print(p)
+    print(f'\n  Verified {verified}  |  missing {missing}  |  size mismatch {mismatched}'
+          f'  (backend: {type(store.backend).__name__})')
+
+
 # ── Git / repo ───────────────────────────────────────────────────────────────
 
 def _git(repo_path: str, *args) -> str:
@@ -3213,6 +3294,23 @@ class OttShell(cmd.Cmd):
     def complete_backfill(self, text, line, begidx, endidx):
         return [f for f in ('--workers',) if f.startswith(text)]
 
+    def do_verify_objects(self, arg):
+        """verify-objects [--workers N]  — Audit every archived entry
+        against the active backend (existence + size), N at a time
+        concurrently (default 8, or OTT_BACKFILL_WORKERS). For S3, this
+        always queries the bucket directly — it does not trust the local
+        cache — so it's the real answer to "did this actually upload"."""
+        parts = shlex.split(arg)
+        workers = _default_backfill_workers()
+        if '--workers' in parts:
+            i = parts.index('--workers')
+            if i + 1 < len(parts):
+                workers = int(parts[i + 1])
+        _run(cmd_verify_objects, workers)
+
+    def complete_verify_objects(self, text, line, begidx, endidx):
+        return [f for f in ('--workers',) if f.startswith(text)]
+
     def do_qr(self, arg):
         """qr [hash|file]  — QR code for a hash, file SHA256, or current Merkle root."""
         parts = shlex.split(arg)
@@ -3450,6 +3548,10 @@ def main():
     p_backfill.add_argument('--workers', type=int, default=None,
                              help='Concurrent uploads (default 8, or OTT_BACKFILL_WORKERS)')
 
+    p_vobj = sub.add_parser('verify-objects', help='Audit every archived entry against the active backend (existence + size)')
+    p_vobj.add_argument('--workers', type=int, default=None,
+                         help='Concurrent checks (default 8, or OTT_BACKFILL_WORKERS)')
+
     p_qr = sub.add_parser('qr', help='QR code for a hash, file, or current root')
     p_qr.add_argument('target', nargs='?')
 
@@ -3512,6 +3614,8 @@ def main():
             cmd_open(args.name)
         elif args.cmd == 'backfill':
             cmd_backfill(args.workers if args.workers is not None else _default_backfill_workers())
+        elif args.cmd == 'verify-objects':
+            cmd_verify_objects(args.workers if args.workers is not None else _default_backfill_workers())
         elif args.cmd == 'qr':
             t = args.target
             if not t:
