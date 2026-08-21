@@ -41,6 +41,32 @@ def broadcast_commitment(commitment_hex: str, wif: str, network: str = 'testnet'
     return tx_hash
 
 
+def bump_fee(wif: str, fee: int, network: str = 'testnet') -> str:
+    """
+    CPFP fee bump for a stuck broadcast: spends this wallet's own pending
+    (even unconfirmed) change output in a brand-new transaction at a
+    higher fee rate. Since the new tx spends an output from the stuck
+    parent, miners can only collect the higher combined fee by confirming
+    both together — that's what pulls the stuck tx along with it.
+
+    Not BIP125 RBF (replacing the stuck tx outright) — `bit`'s send()
+    doesn't expose sequence-number control for that. CPFP doesn't need
+    the original tx to have signaled anything though, just a spendable
+    output still sitting in this same wallet, so it works regardless.
+
+    Returns the new transaction hash.
+    """
+    check_available()
+    key = load_key(wif, network)
+    key.get_unspents()  # includes mempool — this is what makes CPFP possible
+    if not key.unspents:
+        raise RuntimeError(
+            'No spendable UTXOs (confirmed or unconfirmed) for this wallet — '
+            'nothing to bump (or the stuck tx already confirmed)'
+        )
+    return key.send([], fee=fee)
+
+
 def get_balance(wif: str, network: str = 'testnet') -> int:
     """Return balance in satoshis."""
     check_available()

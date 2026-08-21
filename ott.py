@@ -1488,6 +1488,57 @@ def cmd_broadcast(commitment: str | None, wif: str, network: str = 'testnet'):
         print('  Recorded tx_hash on the matching ledger entry.')
 
 
+def cmd_bump_fee(wif: str, fee: int = 10, network: str = 'testnet'):
+    """CPFP fee bump for a stuck `ott broadcast` — spends the wallet's own
+    pending change output in a new tx at a higher fee rate, so miners are
+    incentivized to confirm both the stuck parent and this child together.
+    Not BIP125 RBF (the `bit` library backing `ott broadcast` doesn't
+    expose sequence-number control for a true replacement); CPFP works
+    without that as long as the stuck tx left a spendable output back to
+    this same wallet, which `key.send([], message=..., fee=2)` always
+    does when there's change. Default 10 sat/vbyte is 5x the fixed 2
+    sat/vbyte `ott broadcast` uses, meant as "clearly higher," not tuned
+    to any live mempool — pass --fee for an actual current rate."""
+    from broadcast import bump_fee as _bump_fee, check_available, get_balance
+
+    try:
+        check_available()
+    except RuntimeError as e:
+        print(f'  ✗ {e}')
+        return
+
+    try:
+        balance = get_balance(wif, network)
+    except Exception as e:
+        print(f'  ✗ Could not check wallet balance: {e}')
+        return
+    print(f'  Wallet balance: {balance:,} sats  ({network})')
+    if balance == 0:
+        print('  ✗ Zero balance — nothing to bump (or the stuck tx already confirmed).')
+        return
+
+    print(f'  Bumping with a new tx at {fee} sat/vbyte…')
+    try:
+        tx_hash = _bump_fee(wif, fee, network)
+    except Exception as e:
+        print(f'  ✗ Bump failed: {e}')
+        return
+
+    print(f'  ✅ Bump tx: {tx_hash}')
+    explorer = 'https://blockstream.info/tx/' if network == 'mainnet' else 'https://blockstream.info/testnet/tx/'
+    url = explorer + tx_hash
+    print(f'  {url}')
+    cmd_qr(url, label='view bump transaction')
+
+    store = get_store()
+    ledger = store.load_ledger()
+    if ledger:
+        last = ledger[-1]
+        bumps = last.get('bump_tx_hashes', []) + [tx_hash]
+        if store.update_ledger_entry(last['commitment'], {'bump_tx_hashes': bumps}):
+            print('  Recorded bump tx on the most recent ledger entry.')
+
+
 def cmd_keygen(network: str = 'testnet'):
     """Generate a fresh wallet key for `ott broadcast`. Deliberately does
     NOT QR the WIF — a QR code of a private key sitting in terminal
@@ -2956,6 +3007,33 @@ class OttShell(cmd.Cmd):
             return
         _run(cmd_broadcast, rest[0] if rest else None, wif, network)
 
+    def do_bump_fee(self, arg):
+        """bump-fee --wif <WIF_KEY> [--fee SAT_PER_VBYTE] [--network testnet|mainnet]
+        — CPFP fee bump for a stuck `ott broadcast` tx: spends the wallet's
+        pending change output in a new tx at a higher fee rate so miners
+        confirm both together. Not RBF — see cmd_bump_fee's docstring.
+        Default fee is 10 sat/vbyte."""
+        parts = shlex.split(arg)
+        wif = None
+        fee = 10
+        network = 'testnet'
+        i = 0
+        while i < len(parts):
+            if parts[i] == '--wif' and i + 1 < len(parts):
+                i += 1
+                wif = parts[i]
+            elif parts[i] == '--fee' and i + 1 < len(parts):
+                i += 1
+                fee = int(parts[i])
+            elif parts[i] == '--network' and i + 1 < len(parts):
+                i += 1
+                network = parts[i]
+            i += 1
+        if not wif:
+            print('  Usage: bump-fee --wif <WIF_KEY> [--fee SAT_PER_VBYTE] [--network testnet|mainnet]')
+            return
+        _run(cmd_bump_fee, wif, fee, network)
+
     def do_keygen(self, arg):
         """keygen [--network testnet|mainnet]  — Generate a fresh wallet
         key for `ott broadcast`. Prints the WIF (keep private) and a QR
@@ -3330,6 +3408,11 @@ def main():
     p_bc.add_argument('--wif', required=True, help='Wallet WIF private key')
     p_bc.add_argument('--network', default='testnet', choices=['testnet', 'mainnet'])
 
+    p_bump = sub.add_parser('bump-fee', help='CPFP fee bump for a stuck broadcast tx')
+    p_bump.add_argument('--wif', required=True, help='Wallet WIF private key')
+    p_bump.add_argument('--fee', type=int, default=10, help='sat/vbyte for the bump tx (default 10)')
+    p_bump.add_argument('--network', default='testnet', choices=['testnet', 'mainnet'])
+
     p_kg = sub.add_parser('keygen', help='Generate a fresh wallet key for ott broadcast')
     p_kg.add_argument('--network', default='testnet', choices=['testnet', 'mainnet'])
 
@@ -3407,6 +3490,8 @@ def main():
             cmd_commit()
         elif args.cmd == 'broadcast':
             cmd_broadcast(args.commitment, args.wif, args.network)
+        elif args.cmd == 'bump-fee':
+            cmd_bump_fee(args.wif, args.fee, args.network)
         elif args.cmd == 'keygen':
             cmd_keygen(args.network)
         elif args.cmd == 'verify':
