@@ -2809,6 +2809,20 @@ class OttShell(cmd.Cmd):
 
     # ── completion helpers ────────────────────────────────────────────────────
 
+    _QUOTE_SPECIALS = set(' ()[]&!\'";,')
+
+    def _quote(self, s: str) -> str:
+        """Wrap a completion candidate in double-quotes if it contains any
+        shell-special character (space included) — without this, readline
+        inserts the raw name into the line, and on Enter shlex.split()
+        breaks it apart at every space instead of treating it as the one
+        argument it actually is (e.g. "Books/Architecture/Go House Go -
+        Tiny Homes.pdf" becomes just "Books/Architecture/Go"). Quoting is
+        more reliable than backslash-escaping across readline builds."""
+        if any(c in s for c in self._QUOTE_SPECIALS):
+            return '"' + s.replace('"', '\\"') + '"'
+        return s
+
     def _manifest_names(self, text: str) -> list[str]:
         """Substring match, not prefix-only: readline's completer_delims
         still splits on space (see preloop — can't drop that without
@@ -2819,14 +2833,14 @@ class OttShell(cmd.Cmd):
         thing a prefix match would ever complete; substring matching lets
         any distinctive word from later in the name complete it too."""
         try:
-            return [e['name'] for e in get_store().load_manifest()
+            return [self._quote(e['name']) for e in get_store().load_manifest()
                     if text in e['name']]
         except OttNotFoundError:
             return []
 
     def _video_names(self, text: str) -> list[str]:
         try:
-            return [e['name'] for e in get_store().load_manifest()
+            return [self._quote(e['name']) for e in get_store().load_manifest()
                     if e.get('type') == 'video' and text in e['name']]
         except OttNotFoundError:
             return []
@@ -2854,8 +2868,8 @@ class OttShell(cmd.Cmd):
             tail = text
             out_prefix = ''
         dirs, files = _group_children(entries, base)
-        out = [out_prefix + n + '/' for n in dirs if n.startswith(tail)]
-        out += [out_prefix + f['name'] for f in files if tail in f['name']]
+        out = [self._quote(out_prefix + n + '/') for n in dirs if n.startswith(tail)]
+        out += [self._quote(out_prefix + f['name']) for f in files if tail in f['name']]
         return out
 
     def _files(self, text: str) -> list[str]:
@@ -2866,20 +2880,10 @@ class OttShell(cmd.Cmd):
         if text.startswith('~') and not expanded.startswith('~'):
             home = os.path.expanduser('~')
             matches = [('~' + m[len(home):] if m.startswith(home) else m) for m in matches]
-        # Wrap in double-quotes if the path contains any shell-special chars.
-        # Quoting is more reliable than backslash-escaping across readline builds.
-        SPECIALS = set(' ()[]&!\'";,')
-
-        def _quote(s):
-            if any(c in s for c in SPECIALS):
-                # Escape any embedded double-quotes, then wrap
-                return '"' + s.replace('"', '\\"') + '"'
-            return s
-
         out = []
         for m in matches:
             is_dir = os.path.isdir(os.path.expanduser(m)) and not m.endswith('/')
-            out.append(_quote(m + '/' if is_dir else m))
+            out.append(self._quote(m + '/' if is_dir else m))
         return out
 
     def complete_add(self, text, line, begidx, endidx):
@@ -2975,7 +2979,7 @@ class OttShell(cmd.Cmd):
 
     def complete_rm(self, text, line, begidx, endidx):
         try:
-            return [e['name'] for e in get_store().load_staged() if e['name'].startswith(text)]
+            return [self._quote(e['name']) for e in get_store().load_staged() if e['name'].startswith(text)]
         except OttNotFoundError:
             return []
 
@@ -3113,7 +3117,7 @@ class OttShell(cmd.Cmd):
         out = self._archive_dir_names(text)
         if '/' not in text:
             try:
-                out += [e['name'] for e in get_store().load_manifest()
+                out += [self._quote(e['name']) for e in get_store().load_manifest()
                         if e.get('type') == 'repo' and e['name'].startswith(text)]
             except OttNotFoundError:
                 pass
@@ -3156,7 +3160,7 @@ class OttShell(cmd.Cmd):
             tail = text
             out_prefix = ''
         dirs, _ = _group_children(entries, base)
-        return [out_prefix + n + '/' for n in dirs if n.startswith(tail)]
+        return [self._quote(out_prefix + n + '/') for n in dirs if n.startswith(tail)]
 
     def do_commit(self, _arg):
         """commit  — Archive any staged files, then commit the Merkle root
