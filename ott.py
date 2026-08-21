@@ -2086,6 +2086,22 @@ def _render_progress(done: int, total: int, suffix: str = '', width: int = 30):
     sys.stdout.flush()
 
 
+def _recompute_digest(path: str, entry: dict) -> str:
+    """Recompute a file's content hash the same way cmd_add originally
+    did — the guard that catches a source file whose content has changed
+    since it was archived (overwritten, re-recorded, re-ripped) before
+    that new content gets uploaded under the old, no-longer-matching
+    hash key. Content-addressed storage's whole invariant is key ==
+    hash(value); nothing upstream of this enforced that for backfill."""
+    if entry.get('type') == 'video':
+        chunk_size = entry.get('chunk_size') or CHUNK_SIZE_DEFAULT
+        chunks = chunk_hashes(path, chunk_size)
+        if not chunks:
+            chunks = [hashlib.sha256(b'').hexdigest()]
+        return merkle_root(chunks)
+    return sha256_file(path)
+
+
 def cmd_backfill(workers: int = BACKFILL_WORKERS_DEFAULT):
     """Store archive copies for entries that are on disk but not yet stored
     under the currently active backend. This is also the migration path
@@ -2108,12 +2124,21 @@ def cmd_backfill(workers: int = BACKFILL_WORKERS_DEFAULT):
     Progress renders as a single updating bar on a real terminal; piped or
     redirected output (isatty() false — a log file, CI, etc.) falls back
     to one line per completed file instead, since overwriting a \\r line
-    is meaningless once it's not being watched live."""
+    is meaningless once it's not being watched live.
+
+    Before uploading, re-hashes the source and refuses if it no longer
+    matches the archived sha256 (see _recompute_digest) — otherwise a
+    file that changed on disk since archiving (overwritten, re-recorded,
+    re-ripped at the same path) gets uploaded under its *old* hash key,
+    silently breaking content-addressing's key == hash(value) invariant.
+    Reported as "source changed since archiving", separate from actual
+    upload errors — run `ott verify-objects` afterward to see any that
+    slipped through before this guard existed."""
     store = get_store()
     store.backend  # force lazy backend construction before threads start
     entries = [e for e in store.load_manifest() if e.get('type') != 'repo']
     local_objects = LocalStorageBackend(store.objects_dir)
-    done = had = missing = errors = 0
+    done = had = missing = errors = changed = 0
     total = len(entries)
     live = sys.stdout.isatty()
 
@@ -2126,6 +2151,13 @@ def cmd_backfill(workers: int = BACKFILL_WORKERS_DEFAULT):
             src = local_objects.ensure_local(sha)
         if not src:
             return ('missing', e, None)
+        try:
+            live_digest = _recompute_digest(src, e)
+        except OSError as exc:
+            return ('error', e, f'could not re-hash source: {exc}')
+        if live_digest != sha:
+            return ('changed', e, f'{src} no longer hashes to the archived value — '
+                                   f'source changed since archiving, not uploading')
         try:
             store.put_object(sha, src)
         except OSError as exc:
@@ -2140,6 +2172,11 @@ def cmd_backfill(workers: int = BACKFILL_WORKERS_DEFAULT):
                 had += 1
             elif status == 'missing':
                 missing += 1
+            elif status == 'changed':
+                changed += 1
+                if live:
+                    sys.stdout.write('\n')
+                print(f'  ⚠️  {e["name"]}: {err}')
             elif status == 'error':
                 errors += 1
                 if live:
@@ -2150,11 +2187,13 @@ def cmd_backfill(workers: int = BACKFILL_WORKERS_DEFAULT):
                 if not live:
                     print(f'  + stored copy of {e["name"]}')
             if live:
-                _render_progress(done + had + missing + errors, total, e['name'])
+                _render_progress(done + had + missing + errors + changed, total, e['name'])
 
     if live and total:
         sys.stdout.write('\n')
     summary = f'\n  Backfilled {done}  |  already stored {had}  |  not found on disk {missing}'
+    if changed:
+        summary += f'  |  source changed since archiving {changed}'
     if errors:
         summary += f'  |  failed {errors}'
     print(summary)
