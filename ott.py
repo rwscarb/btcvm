@@ -2458,6 +2458,72 @@ def cmd_repo_update(repo_path_or_name: str):
     cmd_repo_add(entry.get('last_path', abs_path))
 
 
+def cmd_repo_outdated() -> list[dict]:
+    """List archived repos whose on-disk HEAD has moved past the archived
+    commit. Purely local — compares the stored git_hash against `git
+    rev-parse HEAD` at each repo's last_path, never fetches from a remote,
+    so this answers "has the checkout on this machine moved on", not
+    "is upstream ahead". Repos missing from last_path, or with no git_hash
+    change, are silently skipped rather than listed. Returns the outdated
+    entries (each augmented with the live hash/tag/behind-count) so
+    `update-all` can reuse the same scan instead of running it twice."""
+    store = get_store()
+    entries = [e for e in store.load_manifest() if e.get('type') == 'repo']
+    outdated = []
+    if not entries:
+        print('  No repos archived.')
+        return outdated
+    if not _git_available():
+        raise OttError('git not found in PATH')
+
+    for e in entries:
+        path = e.get('last_path', '')
+        if not os.path.isdir(os.path.join(path, '.git')):
+            continue
+        try:
+            current_hash = _git(path, 'rev-parse', 'HEAD')
+        except OttError:
+            continue
+        if current_hash == e['git_hash']:
+            continue
+        try:
+            behind = _git(path, 'rev-list', '--count', f'{e["git_hash"]}..{current_hash}')
+        except OttError:
+            behind = '?'
+        try:
+            current_tag = _git(path, 'describe', '--tags', '--always')
+        except OttError:
+            current_tag = None
+        outdated.append({**e, '_current_hash': current_hash, '_behind': behind, '_current_tag': current_tag})
+
+    if not outdated:
+        print('  All archived repos are up to date with their local checkouts.')
+        return outdated
+
+    print(f'  {"name":<28} {"archived":<16} {"current":<16} {"behind":>7}  tag')
+    print('  ' + '-' * 90)
+    for e in outdated:
+        stored_tag = e.get('git_tag') or '—'
+        cur_tag = e['_current_tag'] or '—'
+        tag_col = cur_tag if cur_tag == stored_tag else f'{stored_tag} → {cur_tag}'
+        print(f'  {e["name"]:<28} {e["git_hash"][:14]}…  {e["_current_hash"][:14]}…  '
+              f'{e["_behind"]:>7}  {tag_col}')
+    return outdated
+
+
+def cmd_repo_update_all():
+    """Re-add every archived repo currently outdated on disk — batch form
+    of `ott repo update <name>`. Reuses cmd_repo_outdated's scan so the
+    outdated table prints once, then updates each entry to its current
+    on-disk HEAD via the same path cmd_repo_update already uses."""
+    outdated = cmd_repo_outdated()
+    if not outdated:
+        return
+    print(f'\n  Updating {len(outdated)} repo(s)...\n')
+    for e in outdated:
+        cmd_repo_add(e['last_path'])
+
+
 def cmd_repo(subcmd: str, args: list[str]):
     """Dispatch ott repo <subcmd> <args>."""
     if subcmd in ('add', 'a'):
@@ -2474,6 +2540,10 @@ def cmd_repo(subcmd: str, args: list[str]):
         if not args:
             raise OttError('Usage: repo update <path_or_name>')
         cmd_repo_update(args[0])
+    elif subcmd in ('outdated', 'o'):
+        cmd_repo_outdated()
+    elif subcmd in ('update-all', 'ua'):
+        cmd_repo_update_all()
     elif subcmd in ('tag', 't'):
         if len(args) < 2:
             raise OttError('Usage: repo tag <path_or_name> <tagname> [key_id] [message]')
@@ -2499,7 +2569,7 @@ def cmd_repo(subcmd: str, args: list[str]):
         else:
             cmd_qr(store.current_root(), label='current Merkle root')
     else:
-        print('  repo subcommands: add, list, verify, update, qr')
+        print('  repo subcommands: add, list, verify, update, outdated, update-all, tag, verify-tag, qr')
 
 
 def cmd_qr(data: str, label: str = ''):
@@ -2950,17 +3020,21 @@ class OttShell(cmd.Cmd):
         return self._files(text)
 
     def do_repo(self, arg):
-        """repo <add|list|verify|update|tag|verify-tag|qr> [args]  — Archive git repos."""
+        """repo <add|list|verify|update|outdated|update-all|tag|verify-tag|qr> [args]
+        — Archive git repos. `outdated` lists archived repos whose on-disk
+        HEAD has moved past what's archived (local-only, no fetch);
+        `update-all` re-archives every one of those in a batch."""
         parts = shlex.split(arg)
         if not parts:
-            print('  repo subcommands: add, list (ls), verify (v), update (up), tag (t), verify-tag (vt), qr')
+            print('  repo subcommands: add, list (ls), verify (v), update (up), '
+                  'outdated (o), update-all (ua), tag (t), verify-tag (vt), qr')
             return
         _run(cmd_repo, parts[0], parts[1:])
 
     def complete_repo(self, text, line, begidx, endidx):
         parts = shlex.split(line[:begidx])
         if len(parts) == 1:  # completing subcommand
-            subcmds = ['add', 'list', 'verify', 'update', 'tag', 'verify-tag', 'qr']
+            subcmds = ['add', 'list', 'verify', 'update', 'outdated', 'update-all', 'tag', 'verify-tag', 'qr']
             return [s for s in subcmds if s.startswith(text)]
         if len(parts) == 2:  # completing path/name
             if parts[1] in ('verify', 'v', 'update', 'up', 'qr', 'tag', 't', 'verify-tag', 'vt'):
@@ -3299,8 +3373,9 @@ def main():
     p_repo = sub.add_parser('repo', help='Archive git repos')
     p_repo.add_argument('subcmd',
                         choices=['add', 'list', 'ls', 'verify', 'update', 'up',
+                                 'outdated', 'o', 'update-all', 'ua',
                                  'tag', 't', 'verify-tag', 'vt', 'qr'],
-                        metavar='add|list|verify|update|tag|verify-tag|qr')
+                        metavar='add|list|verify|update|outdated|update-all|tag|verify-tag|qr')
     p_repo.add_argument('args', nargs='*')
 
     args = parser.parse_args()
