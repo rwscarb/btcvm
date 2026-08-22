@@ -173,13 +173,16 @@ things the flat CLI doesn't have:
 | `commit` / `sync` | Archive everything staged, then commit the Merkle root to the ledger (same action, either name) |
 | `l [-a] [-t tag] [-b] [dir]` | One-level `ls`-style view of the archive hierarchy (from `orig_path`) |
 | `tree [-a] [-t tag] [-dN] [-b] [dir]` | Recursive tree view; `-d0` for unlimited depth |
-| `cd`, `pwd` | Navigate the *archive* hierarchy (real filesystem nav is `lcd`/`lpwd`) |
+| `cd`, `pwd` | Navigate the *archive* hierarchy (real filesystem nav is `lcd`/`lpwd`) — `cd`'ing to a repo's name instead jumps the real filesystem cwd to that repo's checkout, since repos have no virtual file tree of their own |
 | `list` / `ls [pattern]` | Full flat dump of every path in one table, optionally filtered by regex (bare or `/slash-delimited/`) |
-| `open <name_or_hash>` | Open an archived file with the OS default handler (prefers the live copy, falls back to the archived one) |
+| `open <name_or_hash>` (alias `o`) | Open an archived file with the OS default handler (prefers the live copy, falls back to the archived one) |
 | `mv <name> <new_path>` | Update an entry's tracked path; moves into an existing dir like real `mv` |
 | `reindex [root]` | One indexed filesystem scan — relocates every stale entry and re-anchors `orig_path` to the archive root |
 | `tag <add\|rm\|list> <pattern> <tagname>` | Bulk-tag entries by regex match against their archive path |
-| `repo <add\|list\|verify\|update\|tag\|verify-tag\|qr>` | Track a git repo's HEAD and (optionally) a GPG-signed release tag in the archive |
+| `repo <add\|list\|verify\|update\|outdated\|update-all\|tag\|verify-tag\|qr>` | Track a git repo's HEAD and (optionally) a GPG-signed release tag in the archive; `outdated` (alias `o`) checks every tracked repo against its remote, `update-all` (alias `ua`) pulls all of them |
+| `backfill [--workers N]` | Store archive copies for entries on disk but not yet uploaded to the active backend — also the migration path when switching backends (e.g. local → S3). N concurrent (default 8, or `OTT_BACKFILL_WORKERS`); live progress bar on a TTY, one line per file when piped |
+| `verify-objects [--workers N]` | Audit every archived entry against the active backend (existence + size) — for S3 this always queries the bucket directly, bypassing the local cache, so it's the real answer to "did this actually upload" |
+| `bump-fee --wif <WIF> [--fee SAT_PER_VBYTE] [--network testnet\|mainnet]` | CPFP fee bump for a stuck `broadcast` tx — spends the pending change output at a higher fee so miners confirm both together (not RBF). Default 10 sat/vbyte |
 | `verify-chain [-c]` | Verify every ledger commit against real Bitcoin (refetches each block's actual hash) — `-c` also checks the OP_RETURN landed |
 | `keygen [--network]` | Generate a wallet key for `broadcast` (prints WIF + a QR of the address only, never the key) |
 | `broadcast [--wif]` | Broadcast a commitment as a Bitcoin OP_RETURN tx |
@@ -212,6 +215,12 @@ make ott-clean      # remove manifest + ledger
 | `OTT_MANIFEST` | `ott_manifest.jsonl` | Manifest path |
 | `OTT_LEDGER` | `ott_ledger.jsonl` | Ledger path |
 | `OTT_CHUNK_BYTES` | `262144` (256 KB) | Video chunk size |
+| `OTT_HOME` | `~/.ott` | Archive root when not using a local `.ott/` dir |
+| `OTT_BACKEND` | `local` | Storage backend — `local` or `s3` (needs `pip install btcvm[s3]`) |
+| `OTT_S3_BUCKET` | — | Required when `OTT_BACKEND=s3` |
+| `OTT_S3_PREFIX` | `''` | Optional key prefix within the bucket |
+| `OTT_S3_CACHE_DIR` | `.ott/cache` | Local cache dir for S3-backed objects |
+| `OTT_BACKFILL_WORKERS` | `8` | Default concurrency for `backfill`/`verify-objects` |
 
 **Proof chain for a video chunk:**
 
