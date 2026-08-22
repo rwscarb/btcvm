@@ -62,11 +62,18 @@ Programs are tuples loaded into memory. See `programs.py` for examples.
 **Requirements:** Python 3.11+, no runtime dependencies (stdlib only).
 
 ```bash
-# Install
+# Install from PyPI — https://pypi.org/project/btcvm/
+pip install btcvm
+
+# ...or from a local checkout, for development
 pip install -e .        # editable install
 make install            # same via Makefile
 make dev                # with dev deps (pytest, ruff)
 ```
+
+Installs as flat top-level modules (`import ott`, not `import btcvm.ott`) and
+exposes two commands: `btcvm` (the register machine) and `ott` (the media
+archive — see below).
 
 ### btcvm clock
 
