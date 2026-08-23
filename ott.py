@@ -32,6 +32,7 @@ Commands:
     ott tag rm <pattern> <tagname>   remove a tag from matching entries
     ott tag list [pattern]           all tags with counts, or tags on a match
     ott commit                       commit Merkle root to Bitcoin ledger
+    ott log [-n N] [--oneline]       show commit history (like git log)
     ott verify photo.jpg             Merkle inclusion proof
     ott verify-chunk video.mp4 3     byte-range inclusion proof (video)
     ott find photo.jpg               locate file if it moved; update record
@@ -879,6 +880,56 @@ def cmd_status():
             print('  Status:      ⚠️  uncommitted changes since last commit')
     else:
         print('  Status:      not yet committed to Bitcoin')
+
+
+def cmd_log(limit: int | None = None, oneline: bool = False):
+    """Show commit history, newest first — like `git log`. Each ledger entry
+    from `ott commit` is a "commit": its commitment (SHA256(block_hash +
+    merkle_root)) stands in for the commit hash, ts is the date, and
+    file_count lets us show a +/- delta against the previous commit the way
+    `git log --stat` shows changed files (ott's manifest doesn't track which
+    commit added which file, so a per-file diff isn't available)."""
+    store = get_store()
+    ledger = store.load_ledger()
+    if not ledger:
+        print('  Nothing committed yet — run `ott commit`.')
+        return
+
+    if limit:
+        ledger = ledger[-limit:]
+
+    for i, entry in enumerate(reversed(ledger)):
+        idx = len(ledger) - 1 - i
+        commitment = entry.get('commitment', '?')
+        ts = entry.get('ts', '?')
+        height = entry.get('block_height', '?')
+        file_count = entry.get('file_count')
+        prev_count = ledger[idx - 1].get('file_count') if idx > 0 else None
+        delta = ''
+        if file_count is not None and prev_count is not None and file_count != prev_count:
+            d = file_count - prev_count
+            delta = f'  ({"+" if d > 0 else ""}{d})'
+        on_chain = bool(entry.get('tx_hash'))
+
+        if oneline:
+            head = ' (HEAD)' if idx == len(ledger) - 1 else ''
+            mark = '✅' if on_chain else '·'
+            files = f'{file_count} files{delta}' if file_count is not None else '?'
+            print(f'  {mark} {commitment[:10]}  {ts}  block {height}  {files}{head}')
+            continue
+
+        head = '  (HEAD)' if idx == len(ledger) - 1 else ''
+        print(f'  commit {commitment}{head}')
+        print(f'  Block:    {height}  ({str(entry.get("block_hash", "?"))[:16]}…)')
+        print(f'  Date:     {ts}')
+        if file_count is not None:
+            print(f'  Files:    {file_count}{delta}')
+        if on_chain:
+            network = entry.get('network', 'mainnet')
+            print(f'  On-chain: {entry["tx_hash"][:16]}…  [{network}]')
+        else:
+            print('  On-chain: not broadcast')
+        print()
 
 
 def _print_root_tx(entry: dict):
@@ -3264,6 +3315,26 @@ class OttShell(cmd.Cmd):
             return
         _run(cmd_verify, parts[0], self.archive_cwd)
 
+    def do_log(self, arg):
+        """log [-n N] [--oneline]  — Show commit history, newest first
+        (like `git log`). Each `ott commit` is one entry: commitment
+        (stands in for the commit hash), block/date, file count with a
+        +/- delta vs. the previous commit, and on-chain status. -n limits
+        to the N most recent commits; --oneline is one line per commit."""
+        parts = shlex.split(arg)
+        oneline = any(p in ('--oneline',) for p in parts)
+        limit = None
+        i = 0
+        while i < len(parts):
+            if parts[i] in ('-n', '--limit') and i + 1 < len(parts):
+                i += 1
+                limit = int(parts[i])
+            i += 1
+        _run(cmd_log, limit, oneline)
+
+    def complete_log(self, text, line, begidx, endidx):
+        return [f for f in ('-n', '--limit', '--oneline') if f.startswith(text)]
+
     def do_verify_chain(self, arg):
         """verify_chain [--check-txs]  — Verify every ledger commit against
         real Bitcoin (refetches each recorded block's actual hash and
@@ -3649,6 +3720,12 @@ def main():
     p_verify = sub.add_parser('verify', help='Merkle inclusion proof for a file')
     p_verify.add_argument('path')
 
+    p_log = sub.add_parser('log', help='Show commit history (like git log)')
+    p_log.add_argument('-n', '--limit', type=int, default=None,
+                       help='Only show the N most recent commits')
+    p_log.add_argument('--oneline', action='store_true',
+                       help='One line per commit')
+
     p_vch = sub.add_parser('verify-chain', help='Verify every ledger commit against real Bitcoin')
     p_vch.add_argument('-c', '--check-txs', action='store_true',
                        help='Also confirm the OP_RETURN is present in each block (slower)')
@@ -3730,6 +3807,8 @@ def main():
             cmd_keygen(args.network)
         elif args.cmd == 'verify':
             cmd_verify(args.path)
+        elif args.cmd == 'log':
+            cmd_log(args.limit, args.oneline)
         elif args.cmd == 'verify-chain':
             cmd_verify_chain(args.check_txs)
         elif args.cmd == 'verify-chunk':
