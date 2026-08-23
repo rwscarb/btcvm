@@ -230,6 +230,19 @@ class StorageBackend:
         that without re-hashing the whole object."""
         raise NotImplementedError
 
+    def is_fully_stored(self, sha256: str) -> bool:
+        """Whether backfill can skip this object entirely — default is just
+        exists(), same meaning as everywhere else. RaidStorageBackend
+        overrides this to require *every* member, not just one: existence
+        for RAID correctly means 'any member has it' everywhere else
+        (verify-objects, restore, ...), but backfill's whole job after
+        adding a new RAID member is topping up whichever members are still
+        missing what the others already have — using plain exists() here
+        would let a member that already had the object under the old
+        single-backend config skip every entry forever, silently leaving
+        newly added members empty."""
+        return self.exists(sha256)
+
 
 class LocalStorageBackend(StorageBackend):
     """Default backend — content-addressed copies under .ott/objects/,
@@ -462,6 +475,9 @@ class RaidStorageBackend(StorageBackend):
 
     def exists(self, sha256: str) -> bool:
         return any(m.exists(sha256) for m in self.members)
+
+    def is_fully_stored(self, sha256: str) -> bool:
+        return all(m.exists(sha256) for m in self.members)
 
     def put(self, sha256: str, src_path: str) -> None:
         errors = []
@@ -2384,7 +2400,7 @@ def cmd_backfill(workers: int = BACKFILL_WORKERS_DEFAULT):
 
     def backfill_one(e: dict) -> tuple[str, dict, str | None]:
         sha = e['sha256']
-        if store.has_object(sha):
+        if store.backend.is_fully_stored(sha):
             return ('had', e, None)
         src = e.get('last_path', '')
         if not os.path.isfile(src):
