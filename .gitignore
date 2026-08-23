@@ -1,5 +1,7 @@
 __pycache__/
+.idea/
 .ott/
+dist/
 build/
 ledger.jsonl
 btcvm.egg-info/
