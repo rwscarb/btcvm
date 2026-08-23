@@ -47,6 +47,10 @@ Commands:
     ott restore photo.jpg /tmp/      copy an archived file's bytes back out
     ott backfill [--workers N]       store copies for entries added before object storage
     ott verify-objects [--workers N] audit every entry against the active backend (existence + size)
+    ott backend show                 current object storage backend + settings
+    ott backend set s3 --bucket B    replace the active backend
+    ott backend add s3 --bucket B    mirror another backend via raid (run backfill after)
+    ott backend remove s3            drop a raid member
     ott qr                           QR code of current Merkle root
     ott                              interactive shell (all commands + aliases)
 """
@@ -564,6 +568,154 @@ def get_backend(store: 'OttStore') -> StorageBackend:
     return _build_backend(kind, store)
 
 
+_BACKEND_KINDS = ('local', 's3', 'gcs')
+
+
+def _parse_backend_flags(args: list[str]) -> tuple[str, str | None, str | None]:
+    """<kind> [--bucket B] [--prefix P] — shared by backend set/add, same
+    ad-hoc flag style as the rest of the shell's arg parsing (see do_host
+    in dura.py for the same pattern in a sibling project)."""
+    if not args:
+        raise OttError('Usage: backend <set|add> <local|s3|gcs> [--bucket NAME] [--prefix PATH]')
+    kind = args[0]
+    if kind not in _BACKEND_KINDS:
+        raise OttError(f'unknown backend kind: {kind!r}  (expected {"/".join(_BACKEND_KINDS)})')
+    bucket = prefix = None
+    i = 1
+    while i < len(args):
+        if args[i] == '--bucket' and i + 1 < len(args):
+            i += 1
+            bucket = args[i]
+        elif args[i] == '--prefix' and i + 1 < len(args):
+            i += 1
+            prefix = args[i]
+        i += 1
+    return kind, bucket, prefix
+
+
+def cmd_backend_show():
+    store = get_store()
+    cfg = store.config()
+    kind = cfg.get('object_backend', 'local')
+    print(f'  object_backend: {kind}')
+    if kind == 'raid':
+        members = cfg.get('raid_backends', [])
+        print(f'  raid_backends:  {", ".join(members) if members else "(none configured)"}')
+        for m in members:
+            _print_backend_settings(cfg, m, indent='    ')
+    elif kind in ('s3', 'gcs'):
+        _print_backend_settings(cfg, kind, indent='  ')
+
+
+def _print_backend_settings(cfg: dict, kind: str, indent: str):
+    if kind == 's3':
+        print(f'{indent}s3_bucket: {cfg.get("s3_bucket", "(not set)")}   '
+              f's3_prefix: {cfg.get("s3_prefix", "")!r}')
+    elif kind == 'gcs':
+        print(f'{indent}gcs_bucket: {cfg.get("gcs_bucket", "(not set)")}   '
+              f'gcs_prefix: {cfg.get("gcs_prefix", "")!r}')
+
+
+def cmd_backend_set(kind: str, bucket: str | None, prefix: str | None):
+    """Replace the active backend outright — same as hand-editing
+    object_backend in .ott/config, just validated and with the bucket/
+    prefix fields written in one step. Existing objects aren't moved;
+    run `ott backfill` afterward if the new backend doesn't already have
+    everything the old one did."""
+    store = get_store()
+    cfg = store.config()
+    cfg['object_backend'] = kind
+    cfg.pop('raid_backends', None)
+    if kind == 's3' and bucket:
+        cfg['s3_bucket'] = bucket
+    if kind == 's3' and prefix is not None:
+        cfg['s3_prefix'] = prefix
+    if kind == 'gcs' and bucket:
+        cfg['gcs_bucket'] = bucket
+    if kind == 'gcs' and prefix is not None:
+        cfg['gcs_prefix'] = prefix
+    store.save_config(cfg)
+    print(f'  object_backend set to {kind!r}.')
+    if kind in ('s3', 'gcs') and not cfg.get(f'{kind}_bucket'):
+        print(f'  ⚠️  no {kind}_bucket set — pass --bucket, or backend commands will fail until one is')
+    print('  Run `ott backfill` to copy existing archived objects into the new backend.')
+
+
+def cmd_backend_add(kind: str, bucket: str | None, prefix: str | None):
+    """Add a backend as a RAID mirror alongside whatever's already active —
+    the incremental version of `set`. If the current backend isn't already
+    raid, it becomes the first member (its existing config is untouched,
+    just wrapped); kind is appended as the second (or later) member."""
+    store = get_store()
+    cfg = store.config()
+    current = cfg.get('object_backend', 'local')
+    members = list(cfg.get('raid_backends', [])) if current == 'raid' else [current]
+    if kind in members:
+        print(f'  {kind!r} is already a raid member ({", ".join(members)}) — nothing to do.')
+        return
+    members.append(kind)
+    cfg['object_backend'] = 'raid'
+    cfg['raid_backends'] = members
+    if kind == 's3' and bucket:
+        cfg['s3_bucket'] = bucket
+    if kind == 's3' and prefix is not None:
+        cfg['s3_prefix'] = prefix
+    if kind == 'gcs' and bucket:
+        cfg['gcs_bucket'] = bucket
+    if kind == 'gcs' and prefix is not None:
+        cfg['gcs_prefix'] = prefix
+    store.save_config(cfg)
+    print(f'  object_backend is now raid: {", ".join(members)}')
+    if kind in ('s3', 'gcs') and not cfg.get(f'{kind}_bucket'):
+        print(f'  ⚠️  no {kind}_bucket set — pass --bucket, or this member will fail until one is')
+    print(f'  Run `ott backfill` to copy existing archived objects into the new {kind!r} member — '
+          f'nothing is copied automatically by this command.')
+
+
+def cmd_backend_remove(kind: str):
+    """Drop a member from raid. Collapses back to a plain single backend
+    (not a 1-member raid, which RaidStorageBackend itself refuses to
+    construct) if this leaves exactly one member — the surviving member's
+    own bucket/prefix config is left in place, untouched, in case it's
+    added back later."""
+    store = get_store()
+    cfg = store.config()
+    if cfg.get('object_backend') != 'raid':
+        raise OttError("object_backend isn't raid — nothing to remove")
+    members = list(cfg.get('raid_backends', []))
+    if kind not in members:
+        raise OttError(f'{kind!r} is not a raid member ({", ".join(members)})')
+    members.remove(kind)
+    if len(members) == 1:
+        cfg['object_backend'] = members[0]
+        cfg.pop('raid_backends', None)
+        store.save_config(cfg)
+        print(f'  removed {kind!r} — only {members[0]!r} left, so object_backend is now {members[0]!r} '
+              f'(no longer raid).')
+    else:
+        cfg['raid_backends'] = members
+        store.save_config(cfg)
+        print(f'  removed {kind!r} from raid — remaining members: {", ".join(members)}')
+
+
+def cmd_backend(subcmd: str, args: list[str]):
+    """Dispatch ott backend <subcmd> <args> — same shape as cmd_tag."""
+    if subcmd == 'show':
+        cmd_backend_show()
+    elif subcmd == 'set':
+        kind, bucket, prefix = _parse_backend_flags(args)
+        cmd_backend_set(kind, bucket, prefix)
+    elif subcmd == 'add':
+        kind, bucket, prefix = _parse_backend_flags(args)
+        cmd_backend_add(kind, bucket, prefix)
+    elif subcmd in ('remove', 'rm'):
+        if not args:
+            raise OttError('Usage: backend remove <local|s3|gcs>')
+        cmd_backend_remove(args[0])
+    else:
+        raise OttError(f'unknown backend subcommand: {subcmd!r}  (show, set, add, remove)')
+
+
 class OttStore:
     def __init__(self, ott_dir: str):
         self.dir           = ott_dir
@@ -617,6 +769,17 @@ class OttStore:
             return {'chunk_size': CHUNK_SIZE_DEFAULT, 'version': 1}
         with open(self.config_path) as f:
             return json.load(f)
+
+    def save_config(self, cfg: dict) -> None:
+        """Only writer of .ott/config besides init — resets the cached
+        backend so a change made mid-session (notably in the interactive
+        shell, where get_store()/OttStore.backend are both process-lifetime
+        singletons) takes effect on the very next command instead of
+        silently continuing to use whatever backend was constructed
+        before the edit."""
+        with open(self.config_path, 'w') as f:
+            json.dump(cfg, f, indent=2)
+        self._backend = None
 
     @property
     def chunk_size(self) -> int:
@@ -3410,6 +3573,27 @@ class OttShell(cmd.Cmd):
             return [s for s in ('add', 'rm', 'list') if s.startswith(text)]
         return []
 
+    def do_backend(self, arg):
+        """backend show                                       — current object storage config
+        backend set <local|s3|gcs> [--bucket B] [--prefix P]   — replace the active backend
+        backend add <local|s3|gcs> [--bucket B] [--prefix P]   — mirror another backend via raid
+        backend remove <local|s3|gcs>                          — drop a raid member
+        Edits .ott/config directly. `set`/`add` don't move any existing
+        archived bytes — run `backfill` afterward to copy them in."""
+        parts = shlex.split(arg)
+        if not parts:
+            print('  Usage: backend <show|set|add|remove> ...')
+            return
+        _run(cmd_backend, parts[0], parts[1:])
+
+    def complete_backend(self, text, line, begidx, endidx):
+        parts = shlex.split(line[:begidx])
+        if len(parts) == 1:
+            return [s for s in ('show', 'set', 'add', 'remove') if s.startswith(text)]
+        if len(parts) == 2:
+            return [s for s in _BACKEND_KINDS if s.startswith(text)]
+        return []
+
     def _archive_dir_names(self, text: str) -> list[str]:
         """Tab-complete dir names for cd/ls/tree, relative to the current
         archive dir. Handles a partial multi-segment path like '82/2'."""
@@ -3896,6 +4080,14 @@ def main():
     p_tag.add_argument('subcmd', choices=['add', 'rm', 'list'], metavar='add|rm|list')
     p_tag.add_argument('args', nargs='*')
 
+    p_backend = sub.add_parser('backend', help='Show or edit the object storage backend in .ott/config')
+    p_backend.add_argument('subcmd', choices=['show', 'set', 'add', 'remove'], metavar='show|set|add|remove')
+    # REMAINDER, not '*' — '*' would make argparse try to match --bucket/--prefix
+    # against this subparser's own options instead of collecting them as args
+    p_backend.add_argument('args', nargs=argparse.REMAINDER,
+                            help='set/add: <local|s3|gcs> [--bucket NAME] [--prefix PATH]  '
+                                 'remove: <local|s3|gcs>')
+
     sub.add_parser('commit', help='Archive staged files and commit the Merkle root to btcvm ledger')
     sub.add_parser('sync',   help='Alias for commit')
     sub.add_parser('shell',  help='Start interactive shell')
@@ -3992,6 +4184,8 @@ def main():
             cmd_tree(args.dir, args.all, args.tag, args.depth, not args.bytes)
         elif args.cmd == 'tag':
             cmd_tag(args.subcmd, args.args)
+        elif args.cmd == 'backend':
+            cmd_backend(args.subcmd, args.args)
         elif args.cmd == 'commit':
             cmd_commit()
         elif args.cmd == 'sync':
