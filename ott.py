@@ -459,10 +459,16 @@ class RaidStorageBackend(StorageBackend):
     can be lost without losing an object, as long as at least one member
     still has it.
 
-    put() writes to every member; a member that fails to accept the write
-    is logged and skipped rather than aborting the whole put — one broken
-    backend shouldn't block archiving to the ones that still work. It's
-    only an error if *every* member fails.
+    put() writes to every member concurrently, not one after another — a
+    sequential loop means every file pays the *sum* of every remote
+    member's upload time (S3 fully finishes before GCS even starts), which
+    on a bandwidth-constrained link turns into hours per file with two
+    remote members and gets worse the more you add. Members run in
+    parallel threads instead, so per-file wall time is closer to the
+    *slowest single member*, not the sum. A member that fails to accept
+    the write is logged and skipped rather than aborting the whole put —
+    one broken backend shouldn't block archiving to the ones that still
+    work. It's only an error if *every* member fails.
 
     ensure_local() reads from the first member that has the object (the
     fast path costs nothing extra when the primary copy is healthy), and
@@ -485,11 +491,18 @@ class RaidStorageBackend(StorageBackend):
 
     def put(self, sha256: str, src_path: str) -> None:
         errors = []
-        for m in self.members:
+
+        def put_one(m):
             try:
                 m.put(sha256, src_path)
+                return None
             except Exception as e:
-                errors.append(f'{type(m).__name__}: {e}')
+                return f'{type(m).__name__}: {e}'
+
+        with ThreadPoolExecutor(max_workers=len(self.members)) as pool:
+            for err in pool.map(put_one, self.members):
+                if err is not None:
+                    errors.append(err)
         if len(errors) == len(self.members):
             raise OttError(f"raid: every member failed to store {sha256[:16]}...: "
                             + '; '.join(errors))
