@@ -30,7 +30,10 @@ jobs:
         run: ruff check .
 
       - name: Run tests
-        run: pytest test_vm.py -v --tb=short --cov=. --cov-report=term-missing
+        # was pinned to test_vm.py only -- test_ott_completion.py and
+        # test_backends.py existed but were never actually run in CI.
+        # No args picks up every test_*.py per pyproject.toml's testpaths.
+        run: pytest -v --tb=short --cov=. --cov-report=term-missing
 
   security:
     name: Security audit (pip-audit)
