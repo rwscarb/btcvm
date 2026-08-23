@@ -8,16 +8,22 @@ global archive at ~/.ott (override with OTT_HOME) so there's always
 somewhere to write — `ott init` is optional, not required.
 
     .ott/
-      config          # JSON: chunk_size, created, version, object_backend, s3_bucket, s3_prefix
+      config          # JSON: chunk_size, created, version, object_backend, s3_bucket, s3_prefix, gcs_bucket, gcs_prefix, raid_backends
       manifest.jsonl  # per-file records; last-write-wins on sha256
       ledger.jsonl    # Bitcoin commitments
       chunks/         # <file_root_hash>.json — chunk lists (video only)
       objects/        # <hash[:2]>/<hash> — content-addressed copies (local backend, default)
-      cache/          # local cache of downloaded objects (s3 backend only)
+      cache/          # local cache of downloaded objects (s3/gcs backends only)
 
 Object storage backend defaults to local (.ott/objects/). Switch to S3 by
 setting object_backend/s3_bucket/s3_prefix in .ott/config, or via env vars
 OTT_BACKEND=s3, OTT_S3_BUCKET, OTT_S3_PREFIX (needs `pip install btcvm[s3]`).
+Same pattern for Google Cloud Storage: object_backend=gcs, gcs_bucket,
+gcs_prefix / OTT_BACKEND=gcs, OTT_GCS_BUCKET, OTT_GCS_PREFIX (needs
+`pip install btcvm[gcs]`). object_backend=raid mirrors two or more of the
+above — every put() writes to every member, every get self-heals a member
+that was missing the object — via OTT_RAID_BACKENDS=local,s3 (or
+raid_backends in .ott/config); each member still needs its own config.
 
 Commands:
     ott init                         create .ott/ in current directory
@@ -67,6 +73,12 @@ try:
     _HAS_BOTO3 = True
 except ImportError:
     _HAS_BOTO3 = False
+
+try:
+    from google.cloud import storage as gcs_storage  # pip install google-cloud-storage (or: pip install btcvm[gcs])
+    _HAS_GCS = True
+except ImportError:
+    _HAS_GCS = False
 
 CHUNK_SIZE_DEFAULT = 256 * 1024  # 256 KB
 BACKFILL_WORKERS_DEFAULT = 8
@@ -347,13 +359,153 @@ class S3StorageBackend(StorageBackend):
             raise
 
 
-def get_backend(store: 'OttStore') -> StorageBackend:
-    """Picks the object backend from .ott/config, with env var overrides —
-    same convention as OTT_CHUNK_BYTES/OTT_HOME. Local is the default;
-    nothing changes for existing archives unless object_backend is set
-    to 's3' (in .ott/config or via OTT_BACKEND) explicitly."""
+class GoogleStorageBackend(StorageBackend):
+    """Objects live at gs://<bucket>/<prefix>/<hash[:2]>/<hash> — same
+    layout and same downloaded-copy caching as S3StorageBackend, just
+    against Google Cloud Storage's client instead of boto3."""
+
+    def __init__(self, bucket: str, prefix: str, cache_dir: str, client=None):
+        if not _HAS_GCS:
+            raise OttError("object_backend gcs needs google-cloud-storage — "
+                            "pip install google-cloud-storage, or 'pip install btcvm[gcs]'")
+        self.bucket_name = bucket
+        self.prefix = prefix.strip('/')
+        self.cache_dir = cache_dir
+        self._client = client  # injectable for tests
+
+    @property
+    def client(self):
+        if self._client is None:
+            self._client = gcs_storage.Client()
+        return self._client
+
+    @property
+    def _bucket(self):
+        return self.client.bucket(self.bucket_name)
+
+    def _key(self, sha256: str) -> str:
+        parts = [self.prefix, sha256[:2], sha256] if self.prefix else [sha256[:2], sha256]
+        return '/'.join(parts)
+
+    def _cache_path(self, sha256: str) -> str:
+        return os.path.join(self.cache_dir, sha256[:2], sha256)
+
+    def exists(self, sha256: str) -> bool:
+        if os.path.isfile(self._cache_path(sha256)):
+            return True
+        return self._bucket.blob(self._key(sha256)).exists()
+
+    def put(self, sha256: str, src_path: str) -> None:
+        if self.exists(sha256):
+            return
+        self._bucket.blob(self._key(sha256)).upload_from_filename(src_path)
+        # Warm the local cache too — the bytes we just uploaded are right here.
+        cache_path = self._cache_path(sha256)
+        if not os.path.isfile(cache_path):
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            import shutil
+            try:
+                os.link(src_path, cache_path)
+            except OSError:
+                shutil.copy2(src_path, cache_path)
+
+    def ensure_local(self, sha256: str) -> str | None:
+        cache_path = self._cache_path(sha256)
+        if os.path.isfile(cache_path):
+            return cache_path
+        from google.cloud.exceptions import NotFound
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        tmp_path = cache_path + '.part'
+        try:
+            self._bucket.blob(self._key(sha256)).download_to_filename(tmp_path)
+        except NotFound:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            return None
+        os.replace(tmp_path, cache_path)
+        return cache_path
+
+    def describe(self, sha256: str) -> str:
+        return f'gs://{self.bucket_name}/{self._key(sha256)}'
+
+    def size(self, sha256: str) -> int | None:
+        """Always checks GCS directly, same reasoning as S3StorageBackend.size —
+        ground truth for verify-objects, not a locally-cached guess."""
+        blob = self._bucket.get_blob(self._key(sha256))
+        return blob.size if blob is not None else None
+
+
+class RaidStorageBackend(StorageBackend):
+    """Mirrors every object across all member backends — RAID-1 style
+    redundancy, not RAID-5/6 parity: no space savings, but any single
+    member (a deleted bucket, a dead disk, an unreachable network path)
+    can be lost without losing an object, as long as at least one member
+    still has it.
+
+    put() writes to every member; a member that fails to accept the write
+    is logged and skipped rather than aborting the whole put — one broken
+    backend shouldn't block archiving to the ones that still work. It's
+    only an error if *every* member fails.
+
+    ensure_local() reads from the first member that has the object (the
+    fast path costs nothing extra when the primary copy is healthy), and
+    self-heals: any member checked *before* the one that succeeded gets
+    the object written back to it, the same way a RAID-1 controller
+    rebuilds a mirror from its surviving pair. Members after the one that
+    succeeded aren't checked on an ordinary read — this isn't a substitute
+    for a real scrub/audit across the whole array (see verify-objects)."""
+
+    def __init__(self, members: list[StorageBackend]):
+        if len(members) < 2:
+            raise OttError("object_backend raid needs at least 2 member backends")
+        self.members = members
+
+    def exists(self, sha256: str) -> bool:
+        return any(m.exists(sha256) for m in self.members)
+
+    def put(self, sha256: str, src_path: str) -> None:
+        errors = []
+        for m in self.members:
+            try:
+                m.put(sha256, src_path)
+            except Exception as e:
+                errors.append(f'{type(m).__name__}: {e}')
+        if len(errors) == len(self.members):
+            raise OttError(f"raid: every member failed to store {sha256[:16]}...: "
+                            + '; '.join(errors))
+
+    def ensure_local(self, sha256: str) -> str | None:
+        found_path = None
+        stale_members = []
+        for m in self.members:
+            path = m.ensure_local(sha256)
+            if path is not None:
+                found_path = path
+                break
+            stale_members.append(m)
+        if found_path is None:
+            return None
+        for m in stale_members:
+            try:
+                m.put(sha256, found_path)
+            except Exception:
+                pass  # best-effort self-heal — an unwritable member here isn't fatal to the read
+        return found_path
+
+    def describe(self, sha256: str) -> str:
+        locations = [m.describe(sha256) for m in self.members if m.exists(sha256)]
+        return ' + '.join(locations) if locations else f'raid: {sha256[:16]}... not found on any member'
+
+    def size(self, sha256: str) -> int | None:
+        for m in self.members:
+            s = m.size(sha256)
+            if s is not None:
+                return s
+        return None
+
+
+def _build_backend(kind: str, store: 'OttStore') -> StorageBackend:
     cfg = store.config()
-    kind = os.environ.get('OTT_BACKEND', cfg.get('object_backend', 'local'))
     if kind == 'local':
         return LocalStorageBackend(store.objects_dir)
     if kind == 's3':
@@ -364,7 +516,36 @@ def get_backend(store: 'OttStore') -> StorageBackend:
         prefix = os.environ.get('OTT_S3_PREFIX', cfg.get('s3_prefix', ''))
         cache_dir = os.environ.get('OTT_S3_CACHE_DIR', os.path.join(store.dir, 'cache'))
         return S3StorageBackend(bucket, prefix, cache_dir)
-    raise OttError(f"Unknown object_backend: {kind!r} (expected 'local' or 's3')")
+    if kind == 'gcs':
+        bucket = os.environ.get('OTT_GCS_BUCKET', cfg.get('gcs_bucket'))
+        if not bucket:
+            raise OttError("object_backend gcs needs a bucket — set OTT_GCS_BUCKET "
+                            "or 'gcs_bucket' in .ott/config")
+        prefix = os.environ.get('OTT_GCS_PREFIX', cfg.get('gcs_prefix', ''))
+        cache_dir = os.environ.get('OTT_GCS_CACHE_DIR', os.path.join(store.dir, 'cache', 'gcs'))
+        return GoogleStorageBackend(bucket, prefix, cache_dir)
+    raise OttError(f"Unknown object_backend: {kind!r} (expected 'local', 's3', 'gcs', or 'raid')")
+
+
+def get_backend(store: 'OttStore') -> StorageBackend:
+    """Picks the object backend from .ott/config, with env var overrides —
+    same convention as OTT_CHUNK_BYTES/OTT_HOME. Local is the default;
+    nothing changes for existing archives unless object_backend is set
+    explicitly. 'raid' mirrors across two or more of the others — set
+    OTT_RAID_BACKENDS=local,s3 (comma-separated) or 'raid_backends' in
+    .ott/config, and each named member still needs its own config (e.g.
+    s3_bucket, gcs_bucket) exactly as it would standalone."""
+    cfg = store.config()
+    kind = os.environ.get('OTT_BACKEND', cfg.get('object_backend', 'local'))
+    if kind == 'raid':
+        members_spec = os.environ.get('OTT_RAID_BACKENDS', ','.join(cfg.get('raid_backends', [])))
+        member_kinds = [k.strip() for k in members_spec.split(',') if k.strip()]
+        if len(member_kinds) < 2:
+            raise OttError("object_backend raid needs at least 2 member backends — set "
+                            "OTT_RAID_BACKENDS=local,s3 (comma-separated) or 'raid_backends' "
+                            "in .ott/config")
+        return RaidStorageBackend([_build_backend(k, store) for k in member_kinds])
+    return _build_backend(kind, store)
 
 
 class OttStore:

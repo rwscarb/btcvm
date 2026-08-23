@@ -36,6 +36,9 @@ dev = [
 s3 = [
   "boto3>=1.34",
 ]
+gcs = [
+  "google-cloud-storage>=2.10",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["."]
