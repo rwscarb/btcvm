@@ -1861,8 +1861,9 @@ def cmd_commit():
     try:
         from clock import get_tip
         height, block_hash = get_tip()
-        if height is None:
-            raise RuntimeError('get_tip returned None — network unreachable?')
+        if height is None or block_hash is None:
+            raise RuntimeError(f'get_tip returned an incomplete result '
+                               f'(height={height}, hash={block_hash}) — network unreachable?')
         block = {'height': height, 'hash': block_hash}
     except Exception as e:
         print(f'  ✗ Could not fetch block: {e}')
