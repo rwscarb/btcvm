@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "btcvm"
-version = "1.4.0"
+version = "1.5.0"
 description = "A minimal register machine that executes in lockstep with Bitcoin blocks"
 readme = "README.md"
 license = { text = "MIT" }
