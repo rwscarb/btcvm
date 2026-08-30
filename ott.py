@@ -87,6 +87,7 @@ except ImportError:
 CHUNK_SIZE_DEFAULT = 256 * 1024  # 256 KB
 BACKFILL_WORKERS_DEFAULT = 8
 VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v', '.mts', '.ts', '.vob', '.mpg', '.mpeg', '.m2ts', '.wmv', '.flv', '.ogv'}
+AUDIO_EXTS = {'.mp3', '.m4a', '.flac', '.wav', '.ogg', '.opus', '.aac', '.wma', '.aiff', '.alac'}
 
 
 def _default_backfill_workers() -> int:
@@ -126,6 +127,10 @@ def chunk_hashes(path: str, chunk_size: int) -> list[str]:
 
 def is_video(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in VIDEO_EXTS
+
+
+def is_audio(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in AUDIO_EXTS
 
 
 # ── Merkle tree ───────────────────────────────────────────────────────────────
@@ -1082,10 +1087,16 @@ def cmd_add(paths: list[str], recursive: bool = False):
             print(f'  ✗ not found: {path}')
             continue
         size = os.path.getsize(path)
-        video = is_video(path)
+        # video and audio are both chunked/hostable the same way -- the
+        # download/verify/host pipeline only ever cares about "does this
+        # have real chunk data", not which of the two it is. Only actual
+        # images (or anything else is_video/is_audio don't recognize)
+        # fall back to a single whole-file hash with no chunks at all.
+        content_type = 'video' if is_video(path) else 'audio' if is_audio(path) else 'image'
+        chunkable = content_type in ('video', 'audio')
         abs_path = os.path.abspath(path)
 
-        if video:
+        if chunkable:
             print(f'  chunking {os.path.basename(path)} ({size:,} bytes)…', end=' ', flush=True)
             chunks = chunk_hashes(path, chunk_size)
             if not chunks:
@@ -1117,16 +1128,16 @@ def cmd_add(paths: list[str], recursive: bool = False):
             'last_path':  abs_path,
             'size':       size,
             'added':      time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-            'type':       'video' if video else 'image',
+            'type':       content_type,
             'n_chunks':   n_chunks,
-            'chunk_size': chunk_size if video else None,
+            'chunk_size': chunk_size if chunkable else None,
         }
-        if video and chunks:
+        if chunkable and chunks:
             entry['_chunks'] = chunks  # carried through to commit/sync, stripped before it hits the manifest
         store.stage_entry(entry)
         staged_hashes.add(digest)
         staged_now += 1
-        tag = f'  [{n_chunks} chunks × {chunk_size // 1024}KB]' if video else ''
+        tag = f'  [{n_chunks} chunks × {chunk_size // 1024}KB]' if chunkable else ''
         print(f'  + {os.path.basename(path)}  {digest[:16]}…  ({size:,} bytes){tag}  [staged]')
 
     if staged_now:
